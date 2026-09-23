@@ -1,0 +1,30 @@
+NOTICE
+======
+
+ApiCluster uses MIT License.
+Copyright (c) 2026 Umbrellalalala
+
+
+Optional sidecar: CLIProxyAPI
+-----------------------------
+
+ApiCluster's "CLI 边车" feature can launch an external executable named
+`CLIProxyAPI.exe` as a child process in order to wrap subscription accounts
+(Claude Code / Codex / Antigravity / Grok / Kimi) as an OpenAI-compatible API.
+
+That binary is NOT part of this repository and is NOT redistributed here.
+It is built from the upstream open-source project:
+
+    CLIProxyAPI
+    https://github.com/router-for-me/CLIProxyAPI
+    Copyright (c) 2025- Luis Pater
+    Copyright (c) 2025- present Router-For.ME
+    Released under the MIT License.
+
+ApiCluster only generates its configuration file and manages the child process
+lifecycle. All credentials handled by CLIProxyAPI are stored under the local
+data directory (%USERPROFILE%\.ApiCluster\cliproxy\auths by default) and never
+leave your machine.
+
+To use this feature, download or build CLIProxyAPI yourself and place it next
+to ApiCluster.exe as `CLIProxyAPI.exe`.

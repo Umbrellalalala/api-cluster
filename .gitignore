@@ -1,0 +1,27 @@
+# 编译产物
+/ApiCluster.exe
+/ApiCluster
+*.exe
+*.exe~
+*.syso
+rsrc.syso
+bin/
+dist/
+
+#  sidecar 用的外部二进制（从上游自行下载，不入库）
+/CLIProxyAPI.exe
+
+# 本地数据：明文密钥与账号库、日志（永不入库）
+/.ApiCluster/
+keys.json
+*.log
+
+# Go
+vendor/
+*.test
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

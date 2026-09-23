@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ApiCluster · 聚合 API Token</title>
+  <script>
+    (function(){try{var t=localStorage.getItem('theme');if(t==='dark'){document.documentElement.setAttribute('data-theme','dark');}}catch(e){}})();
+  </script>
+  <link rel="stylesheet" href="style.css?v=20260923a">
+</head>
+<body>
+  <div class="layout">
+    <!-- 左侧深色导航 -->
+    <aside class="sidebar">
+      <div class="side-logo"><span class="logo-text">API<b>Cluster</b></span></div>
+      <nav class="nav">
+        <button class="nav-item active" data-tab="keys"><span class="nav-ico ico-keys"></span><span class="nav-text">密钥库</span></button>
+        <button class="nav-item" data-tab="vault"><span class="nav-ico ico-vault"></span><span class="nav-text">账号库</span></button>
+        <button class="nav-item" data-tab="route"><span class="nav-ico ico-route"></span><span class="nav-text">自动路由配置</span></button>
+        <button class="nav-item" data-tab="cliproxy"><span class="nav-ico ico-cli"></span><span class="nav-text">订阅账号</span></button>
+        <button class="nav-item" data-tab="panel"><span class="nav-ico ico-panel"></span><span class="nav-text">管理面板</span></button>
+        <button class="nav-item" data-tab="tunnel"><span class="nav-ico ico-tunnel"></span><span class="nav-text">远程隧道</span></button>
+        <button class="nav-item" data-tab="chat"><span class="nav-ico ico-chat"></span><span class="nav-text">对话测试</span></button>
+        <button class="nav-item" data-tab="settings"><span class="nav-ico ico-settings"></span><span class="nav-text">设置</span></button>
+      </nav>
+      <div class="sidebar-foot">
+        <button class="theme-btn" id="theme-toggle"><span id="theme-ico">🌙</span><span id="theme-text">深色</span></button>
+        <div class="side-status">
+          <span id="status-dot" class="dot"></span>
+          <span id="status-text">检测中…</span>
+          <div class="addr" id="status-addr">http://localhost:3003/v1</div>
+        </div>
+      </div>
+      <button class="collapse-btn" id="sidebar-toggle" title="收起侧边栏">‹</button>
+    </aside>
+
+    <!-- 主内容区 -->
+    <main>
+      <!-- 密钥库 -->
+      <section id="tab-keys" class="panel active">
+        <div class="page-head">
+          <h1>密钥库</h1>
+          <button class="btn primary" id="btn-add-custom">＋ 自定义厂商</button>
+        </div>
+        <div class="filters">
+          <input type="search" id="search-provider" placeholder="搜索厂商 / 模型…">
+          <label class="check"><input type="checkbox" id="only-keyed"> 只看已填 Key</label>
+        </div>
+        <div class="pill-tabs">
+          <button class="pill active" data-filter="free">免费模型 <span class="pill-num" id="num-free">0</span></button>
+          <button class="pill" data-filter="paid">付费模型 <span class="pill-num" id="num-paid">0</span></button>
+        </div>
+        <div id="provider-grid" class="grid"></div>
+        <div id="custom-grid-title" class="group-title hidden">自定义厂商</div>
+        <div id="custom-grid" class="grid"></div>
+      </section>
+
+      <!-- 账号库（网站登录账号 / 密码） -->
+      <section id="tab-vault" class="panel">
+        <div class="page-head">
+          <h1>账号库 <span class="muted head-count" id="vault-count"></span></h1>
+          <div class="cli-actions">
+            <button class="mini-btn" id="btn-export-vault" title="导出成一份 Markdown 文件（含明文密码）">⤓ 导出</button>
+            <button class="btn primary" id="btn-add-site">＋ 新建站点</button>
+          </div>
+        </div>
+        <div class="filters">
+          <input type="search" id="vault-search" placeholder="搜索站点 / 网址 / 备注 / 账号…">
+        </div>
+        <div class="muted vault-desc">
+          网站登录账号与密码存在本机 <code>%USERPROFILE%\.ApiCluster\keys.json</code>（与 API Key 同样是明文）。
+          密码默认掩码，👁 显示 20 秒后自动收回；⧉ 一次复制「账号 + 密码」；双击账号别名可重命名；拖 ⋮⋮ 可排站点顺序。
+        </div>
+        <div id="vault-grid" class="grid vault-grid"></div>
+        <div id="vault-empty" class="muted hidden"></div>
+        <div class="muted hint" id="vault-hint"></div>
+      </section>
+
+      <!-- 自动路由配置 -->
+      <section id="tab-route" class="panel">
+        <div class="page-head"><h1>自动路由配置</h1></div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <div class="setting-title">自动路由（inurl）</div>
+            <div class="muted">在已配 Key 的厂商间轮询，某家挂了（5xx/429）自动切换下一家</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="route-enabled"><span class="slider"></span></label>
+        </div>
+        <div class="route-block">
+          <div class="route-head">
+            <h3>路由方案</h3>
+            <button class="mini-btn" id="btn-add-scheme">＋ 新建方案</button>
+          </div>
+          <div class="muted" style="margin-bottom:12px">
+            方案名 = 客户端填的 model 名；下方模型按顺序优先调用，某家挂了自动切换。
+          </div>
+          <div id="scheme-list" class="scheme-list"></div>
+          <div class="muted hint" id="route-hint">修改自动保存</div>
+        </div>
+      </section>
+
+      <!-- 订阅账号（内置 CLIProxyAPI 边车） -->
+      <section id="tab-cliproxy" class="panel">
+        <div class="page-head">
+          <h1>订阅账号</h1>
+          <div class="cli-actions">
+            <button class="mini-btn" id="cli-start">启动</button>
+            <button class="mini-btn" id="cli-stop">停止</button>
+            <button class="mini-btn" id="cli-restart">重启</button>
+            <button class="mini-btn" id="cli-open-panel">🌐 管理面板</button>
+            <button class="mini-btn" id="cli-open-tui">🖥️ TUI 终端</button>
+            <button class="mini-btn" id="cli-fix-key" title="面板报 401 / invalid management key 时点这里，重写密钥并重启边车">🔑 修复管理密钥</button>
+          </div>
+        </div>
+        <div class="muted cli-desc">
+          内置 CLIProxyAPI：把 <b>Claude Code / Codex / Antigravity / Grok / Kimi</b> 等订阅账号用 OAuth 登录后，
+          包装成 OpenAI / Claude / Gemini / Codex 兼容的 API，<b>无需 API Key</b>，并自带多账号轮询、冷却与失败自动换号。
+        </div>
+
+        <div class="cli-card">
+          <div class="cli-card-head">
+            <span id="cli-dot" class="dot"></span>
+            <span id="cli-status-text">检测中…</span>
+            <span class="muted" id="cli-status-sub"></span>
+          </div>
+          <div class="cli-grid" id="cli-status-grid"></div>
+          <div class="muted hint" id="cli-status-error"></div>
+        </div>
+        <div class="key-banner hidden"></div>
+
+        <div class="route-block">
+          <div class="route-head">
+            <h3>登录订阅账号</h3>
+            <span class="muted">点击后自动在系统浏览器打开授权页，完成后本页会自动刷新账号列表</span>
+          </div>
+          <div class="cli-providers" id="cli-providers"></div>
+          <div class="muted hint" id="cli-login-hint"></div>
+        </div>
+
+        <div class="route-block">
+          <div class="route-head">
+            <h3>已登录账号</h3>
+            <button class="mini-btn" id="cli-refresh-accounts">刷新</button>
+          </div>
+          <div id="cli-accounts"></div>
+        </div>
+
+        <div class="route-block">
+          <div class="route-head">
+            <h3>对外端点</h3>
+            <span class="muted">把客户端的 Base URL 指向下面任一地址即可</span>
+          </div>
+          <div id="cli-endpoints"></div>
+          <div class="cli-keyrow">
+            <span class="muted">本地 API Key（客户端请求用）</span>
+            <code id="cli-apikey">-</code>
+            <button class="mini-btn" id="cli-copy-key">复制</button>
+          </div>
+          <div class="cli-keyrow cli-mgmtrow">
+            <span class="muted">管理密钥（登录管理面板 / TUI 用）</span>
+            <code id="cli-mgmtkey">-</code>
+            <button class="mini-btn" id="cli-copy-mgmtkey">复制</button>
+          </div>
+        </div>
+
+        <div class="route-block">
+          <div class="route-head"><h3>边车设置</h3></div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">随 ApiCluster 启动（常驻）</div>
+              <div class="muted">关＝ApiCluster 启动时不拉起、打开管理面板页也不会擅自拉起，只有你点「启动」/「启动并加载面板」才运行；开＝开机后常驻，退出时自动关闭</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="cli-enabled"><span class="slider"></span></label>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">监听端口</div>
+              <div class="muted">默认 8317，修改后需重启边车生效</div>
+            </div>
+            <input type="number" id="cli-port" class="port-input" min="1024" max="65535" placeholder="8317">
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">CLIProxyAPI.exe 路径</div>
+              <div class="muted">留空 = 自动在 ApiCluster.exe 同目录查找</div>
+            </div>
+            <input type="text" id="cli-exepath" class="port-input" placeholder="自动查找">
+          </div>
+          <div class="muted hint" id="cli-settings-hint">修改自动保存</div>
+        </div>
+
+        <div class="route-block">
+          <div class="route-head">
+            <h3>运行日志</h3>
+            <button class="mini-btn" id="cli-refresh-log">刷新</button>
+          </div>
+          <pre class="cli-log" id="cli-log">（暂无日志）</pre>
+        </div>
+      </section>
+
+      <!-- 管理面板（内嵌 CLIProxyAPI CPAMC） -->
+      <section id="tab-panel" class="panel">
+        <div class="page-head">
+          <h1>管理面板</h1>
+          <div class="cli-actions">
+            <button class="mini-btn" id="cli-panel-refresh">⟳ 刷新</button>
+            <button class="mini-btn" id="cli-panel-external">↗ 浏览器打开</button>
+          </div>
+        </div>
+        <div class="muted" id="cli-panel-hint" style="margin-bottom:10px">
+          面板首次加载可能需要联网下载资源，请稍候…
+        </div>
+        <div class="key-banner hidden"></div>
+        <iframe id="cli-panel-frame" class="panel-frame" title="CLIProxyAPI 管理面板"></iframe>
+      </section>
+
+      <!-- 远程隧道（SSH 反向隧道，让远程服务器访问本地 API） -->
+      <section id="tab-tunnel" class="panel">
+        <div class="page-head">
+          <h1>远程隧道</h1>
+          <div class="cli-actions">
+            <button class="mini-btn" id="tun-start">启动</button>
+            <button class="mini-btn" id="tun-stop">停止</button>
+            <button class="mini-btn" id="tun-restart">重启</button>
+          </div>
+        </div>
+        <div class="muted cli-desc">
+          通过 SSH 反向隧道，让远程服务器（如 203.0.113.10）通过 <b>localhost:远程端口</b> 访问本机的 ApiCluster API。
+          本地主动向远程发起连接，无需远程机器开放任何入站端口。
+        </div>
+
+        <div class="cli-card">
+          <div class="cli-card-head">
+            <span id="tun-dot" class="dot"></span>
+            <span id="tun-status-text">检测中…</span>
+            <span class="muted" id="tun-status-sub"></span>
+          </div>
+          <div class="cli-grid" id="tun-status-grid"></div>
+          <div class="muted hint" id="tun-status-error"></div>
+        </div>
+
+        <div class="route-block">
+          <div class="route-head">
+            <h3>连接设置</h3>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">SSH 私钥（.pem）</div>
+              <div class="muted">选择用于登录远程服务器的私钥文件（无密码的 .pem / id_rsa）</div>
+            </div>
+            <div class="tun-pem-row">
+              <input type="text" id="tun-pem" class="port-input" placeholder="如 C:\Users\you\.ssh\id_rsa">
+              <button class="mini-btn" id="tun-browse-pem">浏览…</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">远程主机 IP / 域名</div>
+              <div class="muted">要访问本机的远程服务器地址</div>
+            </div>
+            <input type="text" id="tun-host" class="port-input" placeholder="如 203.0.113.10">
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">用户名</div>
+              <div class="muted">远程服务器的 SSH 登录用户名</div>
+            </div>
+            <input type="text" id="tun-user" class="port-input" placeholder="如 ubuntu">
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">远程端口</div>
+              <div class="muted">远程服务器上映射到的端口（远程访问 localhost:此端口）</div>
+            </div>
+            <input type="number" id="tun-remote-port" class="port-input" min="1" max="65535" placeholder="3003">
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">本地端口</div>
+              <div class="muted">本机要暴露出去的服务端口（默认 = 代理端口）</div>
+            </div>
+            <input type="number" id="tun-local-port" class="port-input" min="1" max="65535" placeholder="3003">
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">随 ApiCluster 启动</div>
+              <div class="muted">开启后，ApiCluster 启动时会自动建立隧道（配合「设置 → 开机自启」实现无人值守）</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="tun-enabled"><span class="slider"></span></label>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-title">断开自动重连</div>
+              <div class="muted">隧道断开后自动按退避策略重连（默认开启，关闭则断开后不再重试）</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="tun-autoreconnect"><span class="slider"></span></label>
+          </div>
+          <div class="muted hint" id="tun-settings-hint">修改自动保存</div>
+        </div>
+
+        <div class="route-block">
+          <div class="route-head">
+            <h3>运行日志</h3>
+            <button class="mini-btn" id="tun-refresh-log">刷新</button>
+          </div>
+          <pre class="cli-log" id="tun-log">（暂无日志）</pre>
+        </div>
+      </section>
+
+      <!-- 对话测试 -->
+      <section id="tab-chat" class="panel">
+        <div class="page-head"><h1>对话测试</h1></div>
+        <div class="chat-box">
+          <div class="model-pick">
+            <label>模型</label>
+            <input id="model-search" class="model-search" autocomplete="off" placeholder="🔍 搜索模型（可输入 inurl / qwen / glm …）">
+            <select id="model-select" class="model-select"></select>
+            <div class="mt-row">
+              <label for="chat-max-tokens">最大输出 tokens</label>
+              <input type="number" id="chat-max-tokens" value="128" min="1" max="8192" class="mt-input">
+              <span class="muted">测试时调小可省额度</span>
+            </div>
+          </div>
+          <div id="chat-log" class="chat-log"></div>
+          <div class="chat-input">
+            <textarea id="chat-text" rows="3" placeholder="输入问题，回车发送（Shift+Enter 换行）"></textarea>
+            <button class="btn primary" id="btn-send">发送</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 设置 -->
+      <section id="tab-settings" class="panel">
+        <div class="page-head"><h1>设置</h1></div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <div class="setting-title">开机自启</div>
+            <div class="muted">登录 Windows 后自动静默启动（仅驻留托盘，不弹窗口）</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="set-autostart"><span class="slider"></span></label>
+        </div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <div class="setting-title">代理端口</div>
+            <div class="muted">OpenAI 兼容入口 http://localhost:{端口}/v1</div>
+          </div>
+          <input type="number" id="set-port" class="port-input" value="3003" min="1024" max="65535">
+        </div>
+        <div class="muted hint" id="settings-hint">修改自动保存</div>
+        <div class="usage-tip">
+          <h3>客户端怎么填？</h3>
+          <table>
+            <tr><th>字段</th><th>填什么</th><th>示例</th></tr>
+            <tr><td>API 地址 / Base URL</td><td>本地代理地址</td><td>http://localhost:3003/v1</td></tr>
+            <tr><td>API Key</td><td>任意值（本地无需鉴权）</td><td>byok</td></tr>
+            <tr><td>模型 Model</td><td>模型 id 或 inurl</td><td>qwen-max / inurl / inurl-code</td></tr>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js?v=20260923a"></script>
+</body>
+</html>
