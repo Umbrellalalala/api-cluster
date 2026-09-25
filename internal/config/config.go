@@ -332,19 +332,28 @@ type VaultSite struct {
 	Accounts []VaultAccount `json:"accounts"`
 }
 
+// LibraryMark 密钥库卡片的收藏与分组标记。
+// 单独按厂商 ID 存一份，而不是塞进 ProviderConfig：后者的保存路径是整条记录覆盖，
+// 塞进去很容易被别的写回清掉（历史上已经因此丢过配置），分组/收藏与 Key 配置互不干扰更安全。
+type LibraryMark struct {
+	Favorite bool   `json:"favorite"`
+	Group    string `json:"group,omitempty"` // 分组名，空 = 未分组
+}
+
 // Config 完整配置
 type Config struct {
 	Keys     map[string]ProviderConfig `json:"keys"`
 	Custom   []CustomProvider          `json:"custom"`
 	Settings Settings                  `json:"settings"`
-	Schemes  []RouteScheme             `json:"schemes"` // 自动路由方案
-	Vault    []VaultSite               `json:"vault"`   // 账号库（网站登录账号密码）
+	Schemes  []RouteScheme             `json:"schemes"`   // 自动路由方案
+	Vault    []VaultSite               `json:"vault"`     // 账号库（网站登录账号密码）
+	Marks    map[string]LibraryMark    `json:"marks"`     // 密钥库收藏 / 分组
 }
 
 var (
 	mu         sync.RWMutex
 	dataDir    string
-	config     = &Config{Keys: map[string]ProviderConfig{}, Settings: Settings{ProxyPort: 3003, AutoOpenBrowser: true, AutoRouteEnabled: true}}
+	config     = &Config{Keys: map[string]ProviderConfig{}, Marks: map[string]LibraryMark{}, Settings: Settings{ProxyPort: 3003, AutoOpenBrowser: true, AutoRouteEnabled: true}}
 	configPath string
 	// dirty 标记内存中的配置已被修改但尚未落盘（用量统计、key 轮换位置等高频变更）
 	dirty atomic.Bool
@@ -414,6 +423,9 @@ func Path() string {
 func finalize(loaded *Config) *Config {
 	if loaded.Keys == nil {
 		loaded.Keys = map[string]ProviderConfig{}
+	}
+	if loaded.Marks == nil {
+		loaded.Marks = map[string]LibraryMark{}
 	}
 	if loaded.Settings.ProxyPort == 0 {
 		loaded.Settings.ProxyPort = 3003
@@ -550,6 +562,10 @@ func Get() *Config {
 		Settings: config.Settings,
 		Schemes:  make([]RouteScheme, 0, len(config.Schemes)),
 		Vault:    make([]VaultSite, 0, len(config.Vault)),
+		Marks:    make(map[string]LibraryMark, len(config.Marks)),
+	}
+	for k, v := range config.Marks {
+		cp.Marks[k] = v
 	}
 	for k, v := range config.Keys {
 		// 深拷贝 slice 字段
@@ -686,6 +702,17 @@ func SetSchemes(schemes []RouteScheme) {
 func SetVault(vault []VaultSite) {
 	mu.Lock()
 	config.Vault = vault
+	mu.Unlock()
+	dirty.Store(true)
+}
+
+// SetMarks 整体替换密钥库的收藏 / 分组标记
+func SetMarks(marks map[string]LibraryMark) {
+	mu.Lock()
+	if marks == nil {
+		marks = map[string]LibraryMark{}
+	}
+	config.Marks = marks
 	mu.Unlock()
 	dirty.Store(true)
 }

@@ -30,6 +30,8 @@ type providerTarget struct {
 	path         string // 接口路径（endpoint），空则用类型默认
 	apiKey       string // 当前使用的 key（由 keyIndex 指向）
 	apiKeys      []string
+	keyNames     []string // 与 apiKeys 一一对应的自定义名称（随轮换一起挪动）
+	keyNos       []int    // 与 apiKeys 一一对应的稳定编号（随轮换一起挪动）
 	keyIndex     int
 	authHeader   string // 鉴权头，空则按类型默认
 	authPrefix   string // 前缀，空则按类型默认
@@ -52,6 +54,7 @@ func (t *providerTarget) currentKey() string {
 
 // rotateKey 切换到下一个 key：把当前 key 移到列表末尾，返回是否成功（多个 key 时才有意义）。
 // 约定：apiKeys 首位即「当前使用」的 key，因此轮换 = 把当前 key 挪到最后。
+// 名称与稳定编号必须跟着一起挪，否则换一次 Key 后「主号」这类标签就贴到别的 Key 上。
 func (t *providerTarget) rotateKey() bool {
 	if len(t.apiKeys) <= 1 {
 		return false
@@ -59,12 +62,53 @@ func (t *providerTarget) rotateKey() bool {
 	if t.keyIndex < 0 || t.keyIndex >= len(t.apiKeys) {
 		t.keyIndex = 0
 	}
-	k := t.apiKeys[t.keyIndex]
-	rest := append([]string{}, t.apiKeys[:t.keyIndex]...)
-	rest = append(rest, t.apiKeys[t.keyIndex+1:]...)
+	i := t.keyIndex
+	t.keyNames = syncNames(t.keyNames, len(t.apiKeys))
+	t.keyNos = syncKeyNos(t.keyNos, len(t.apiKeys))
+	t.keyNames = moveToEnd(t.keyNames, i)
+	t.keyNos = moveToEnd(t.keyNos, i)
+	k := t.apiKeys[i]
+	rest := append([]string{}, t.apiKeys[:i]...)
+	rest = append(rest, t.apiKeys[i+1:]...)
 	t.apiKeys = append(rest, k)
 	t.keyIndex = 0
 	return true
+}
+
+// syncNames 保证 names 与 n 个 key 一一对应（不足补空串，多余截断）
+func syncNames(names []string, n int) []string {
+	if len(names) > n {
+		return names[:n]
+	}
+	return append(names, make([]string, n-len(names))...)
+}
+
+// syncKeyNos 保证编号与 n 个 key 一一对应：不足按当前最大值递增补齐，多余截断
+func syncKeyNos(nos []int, n int) []int {
+	if len(nos) > n {
+		return nos[:n]
+	}
+	max := 0
+	for _, v := range nos {
+		if v > max {
+			max = v
+		}
+	}
+	for len(nos) < n {
+		max++
+		nos = append(nos, max)
+	}
+	return nos
+}
+
+// moveToEnd 把 s[i] 挪到末尾（下标无效或只有一项时原样返回）
+func moveToEnd[T any](s []T, i int) []T {
+	if i < 0 || i >= len(s) || len(s) <= 1 {
+		return s
+	}
+	out := append([]T{}, s[:i]...)
+	out = append(out, s[i+1:]...)
+	return append(out, s[i])
 }
 
 func hasCap(caps []catalog.Capability, want catalog.Capability) bool {
@@ -96,6 +140,14 @@ func routeAlias(model string) (catalog.Capability, bool) {
 		return catalog.CapAudio, true
 	}
 	return "", false
+}
+
+// IsReservedAlias 名字是否占用了内置能力别名。
+// 用户方案会先于别名被匹配（proxy.handleChatCompletion 里 1) 在 2) 之前），
+// 起了同名方案会静默顶掉内置别名，所以保存时必须拒绝。
+func IsReservedAlias(name string) bool {
+	_, ok := routeAlias(name)
+	return ok
 }
 
 // providerModels 返回厂商的有效模型列表（用户覆盖则用覆盖，否则用目录默认）。
@@ -156,7 +208,7 @@ func (s *Server) collectProviders(cap catalog.Capability) []providerTarget {
 			if hasCap(m.Capabilities, cap) {
 				out = append(out, providerTarget{
 					id: p.ID, name: p.Name, baseURL: baseURL, path: pc.Path,
-					apiKey: pc.ActiveKey(), apiKeys: pc.AllKeys(), keyIndex: pc.KeyIndex,
+					apiKey: pc.ActiveKey(), apiKeys: pc.AllKeys(), keyNames: append([]string(nil), pc.KeyNames...), keyNos: append([]int(nil), pc.KeyNos...), keyIndex: pc.KeyIndex,
 					authHeader: pc.AuthHeader, authPrefix: pc.AuthPrefix,
 					providerType: ptype, model: m.ID, cap: cap,
 					limit: pc.ModelLimits[m.ID],
@@ -174,7 +226,7 @@ func (s *Server) collectProviders(cap catalog.Capability) []providerTarget {
 			if customModelHasCap(c, mid, cap) {
 				out = append(out, providerTarget{
 					id: c.ID, name: c.Name, baseURL: c.BaseURL, path: c.Path,
-					apiKey: c.ActiveKey(), apiKeys: c.AllKeys(), keyIndex: c.KeyIndex,
+					apiKey: c.ActiveKey(), apiKeys: c.AllKeys(), keyNames: append([]string(nil), c.KeyNames...), keyNos: append([]int(nil), c.KeyNos...), keyIndex: c.KeyIndex,
 					authHeader: c.AuthHeader, authPrefix: c.AuthPrefix,
 					providerType: c.Type, model: mid, cap: cap,
 					limit: c.ModelLimits[mid],
@@ -259,7 +311,7 @@ func (s *Server) findProviderByModelCfg(cfg *config.Config, modelID string) (pro
 				}
 				return providerTarget{
 					id: p.ID, name: p.Name, baseURL: baseURL, path: pc.Path,
-					apiKey: pc.ActiveKey(), apiKeys: pc.AllKeys(), keyIndex: pc.KeyIndex,
+					apiKey: pc.ActiveKey(), apiKeys: pc.AllKeys(), keyNames: append([]string(nil), pc.KeyNames...), keyNos: append([]int(nil), pc.KeyNos...), keyIndex: pc.KeyIndex,
 					authHeader: pc.AuthHeader, authPrefix: pc.AuthPrefix,
 					providerType: ptype, model: modelID, cap: cap,
 					limit: pc.ModelLimits[modelID],
@@ -276,7 +328,7 @@ func (s *Server) findProviderByModelCfg(cfg *config.Config, modelID string) (pro
 			if mid == modelID {
 				return providerTarget{
 					id: c.ID, name: c.Name, baseURL: c.BaseURL, path: c.Path,
-					apiKey: c.ActiveKey(), apiKeys: c.AllKeys(), keyIndex: c.KeyIndex,
+					apiKey: c.ActiveKey(), apiKeys: c.AllKeys(), keyNames: append([]string(nil), c.KeyNames...), keyNos: append([]int(nil), c.KeyNos...), keyIndex: c.KeyIndex,
 					authHeader: c.AuthHeader, authPrefix: c.AuthPrefix,
 					providerType: c.Type, model: modelID, cap: catalog.CapText,
 					limit: c.ModelLimits[modelID],

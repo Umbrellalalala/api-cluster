@@ -18,6 +18,24 @@ function fmt(n) {
   return String(n);
 }
 
+// toast 右下角浮层：保存失败这类「必须让人看见、但不该拦住操作」的反馈
+function toast(msg, bad) {
+  let box = $('#toast-box');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'toast-box';
+    box.className = 'toast-box';
+    document.body.appendChild(box);
+  }
+  const el = document.createElement('div');
+  el.className = 'toast' + (bad ? ' bad' : '');
+  el.textContent = msg;
+  box.appendChild(el);
+  const hold = bad ? 5200 : 2200;
+  setTimeout(() => el.classList.add('out'), hold - 400);
+  setTimeout(() => el.remove(), hold);
+}
+
 // debounce 防抖：停止触发 ms 毫秒后才执行，避免连续输入时频繁请求
 function debounce(fn, ms) {
   let t = null;
@@ -61,6 +79,38 @@ function legacyCopy(text) {
   }
 }
 
+// copyFlash 复制后把按钮短暂变成 ✓ / ✕，让「有没有拷进去」看得见
+// postJSON 发一个 JSON 请求，失败时给出可见反馈并返回 false
+async function postJSON(url, payload, errPrefix) {
+  try {
+    const res = await fetch(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+    });
+    if (res.ok) return true;
+    const d = await res.json().catch(() => ({}));
+    toast((errPrefix || '保存失败') + '：' + (d.error || ('HTTP ' + res.status)), true);
+    return false;
+  } catch (e) {
+    toast((errPrefix || '保存失败') + '：' + e.message, true);
+    return false;
+  }
+}
+
+function copyFlash(btn, ok) {
+  if (!btn) return;
+  const old = btn.textContent;
+  btn.textContent = ok ? '✓' : '✕';
+  setTimeout(() => { btn.textContent = old; }, 1000);
+}
+
+// copyTo 复制并把结果如实反馈在按钮上
+async function copyTo(btn, text) {
+  if (!text) return false;
+  const ok = await copyText(text);
+  copyFlash(btn, ok);
+  return ok;
+}
+
 window.logoFallback = function (img) {
   const s = document.createElement('span');
   s.className = 'logo-fallback';
@@ -76,7 +126,8 @@ function openExternal(url) {
 
 // ---------- 数据 ----------
 async function fetchConfig() {
-  const editing = document.querySelector('.edit-area:not(.hidden)') || document.querySelector('.card.new-card');
+  const editing = document.querySelector('.edit-area:not(.hidden)') || document.querySelector('.card.new-card') ||
+    !!document.querySelector('#provider-grid input:focus, #custom-grid input:focus');
   const vaultFocused = !!document.querySelector('#vault-grid input:focus, #vault-grid textarea:focus');
   let res;
   try {
@@ -92,6 +143,7 @@ async function fetchConfig() {
     return;
   }
   state.config = await res.json();
+  runningPort = state.config.running_port || 3003;
   hideBootError();
   const models = [];
   const seen = new Set();
@@ -150,6 +202,201 @@ function renderAll() {
   renderRouteConfig();
   renderStatus();
   renderModelSelect();
+}
+
+// ---------- 密钥库：收藏 / 分组 ----------
+// 标记单独存一份（marks: 厂商ID -> {favorite, group}），不塞进 ProviderConfig：
+// 那条记录每条保存路径都是整体覆盖，塞进去很容易被别的写回清掉。
+function marks() { return (state.config && state.config.marks) || {}; }
+
+function markOf(id) {
+  const m = marks()[id];
+  return { favorite: !!(m && m.favorite), group: (m && m.group) || '' };
+}
+
+function allGroups() {
+  const set = new Set();
+  Object.values(marks()).forEach((m) => { if (m && m.group) set.add(m.group); });
+  return Array.from(set).sort((a, b) => a.localeCompare(b, 'zh'));
+}
+
+// 已知存在的厂商 id（删除厂商后残留的标记不该再被计入）
+function knownIds() {
+  const out = new Set();
+  ((state.config && state.config.providers) || []).forEach((p) => out.add(p.id));
+  ((state.config && state.config.custom) || []).forEach((c) => out.add(c.id));
+  return out;
+}
+
+function favoriteCount() {
+  const known = knownIds();
+  return Object.keys(marks()).filter((id) => known.has(id) && marks()[id].favorite).length;
+}
+
+// gridBusy 有人正在编辑卡片时不能整页重建：否则展开的编辑区 / 填一半的新建表单会被抹掉
+function gridBusy() {
+  return !!document.querySelector('#provider-grid .edit-area:not(.hidden), #custom-grid .edit-area:not(.hidden)') ||
+    !!document.querySelector('#custom-grid .card.new-card') ||
+    !!document.querySelector('#provider-grid input:focus, #custom-grid input:focus');
+}
+
+// patchCardMarks 就地更新这一张卡的 ★ 与分组标签（排序留到下次自然重渲染）
+function patchCardMarks(id) {
+  const card = document.querySelector('#provider-grid .card[data-id="' + CSS.escape(id) + '"], #custom-grid .card[data-id="' + CSS.escape(id) + '"]');
+  const mk = markOf(id);
+  if (card) {
+    const fav = card.querySelector('.fav-btn');
+    if (fav) fav.classList.toggle('on', mk.favorite);
+    const grp = card.querySelector('.grp-btn');
+    if (grp) grp.textContent = (mk.group ? '📁 ' + mk.group : '📂 未分组') + ' ▾';
+    if (grp) grp.classList.toggle('set', !!mk.group);
+  }
+  const nf = $('#num-fav');
+  if (nf) nf.textContent = favoriteCount();
+  renderGroupSelect();
+}
+
+function setMark(id, patch) {
+  const all = Object.assign({}, marks());
+  const cur = Object.assign({ favorite: false, group: '' }, all[id] || {}, patch);
+  if (!cur.favorite && !cur.group) delete all[id];
+  else all[id] = { favorite: !!cur.favorite, group: cur.group || '' };
+  state.config.marks = all;
+  if (gridBusy()) patchCardMarks(id); else renderGrid();
+  debouncedSaveMarks();
+}
+
+async function saveMarksNow() {
+  try {
+    const res = await fetch('/api/marks', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(state.config.marks || {})
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) { toast('❌ 收藏/分组保存失败：' + (d.error || ('HTTP ' + res.status)), true); return; }
+    if (d.marks) state.config.marks = d.marks; // 服务端会剔除空标记，两边保持一致
+  } catch (e) {
+    toast('❌ 收藏/分组保存失败：' + e.message, true);
+  }
+}
+const debouncedSaveMarks = debounce(saveMarksNow, 500);
+
+// renameGroup 改名 / 删除分组要一次影响整组卡片
+function renameGroup(from, to) {
+  const all = Object.assign({}, marks());
+  let touched = false;
+  Object.keys(all).forEach((id) => {
+    if (all[id] && all[id].group === from) {
+      all[id] = Object.assign({}, all[id], { group: to || '' });
+      touched = true;
+    }
+  });
+  if (!touched) return;
+  state.config.marks = all;
+  if (gridBusy()) $$('#provider-grid .card, #custom-grid .card').forEach((c) => patchCardMarks(c.dataset.id));
+  else renderGrid();
+  saveMarksNow();
+}
+
+function placePopMenu(menu, anchor) {
+  document.body.appendChild(menu);
+  const r = anchor.getBoundingClientRect();
+  const mh = menu.offsetHeight, mw = menu.offsetWidth;
+  let top = r.bottom + 6;
+  if (top + mh > innerHeight - 8) top = Math.max(8, r.top - mh - 6); // 贴底时朝上弹
+  menu.style.top = top + 'px';
+  menu.style.left = Math.max(8, Math.min(r.left, innerWidth - mw - 12)) + 'px';
+  setTimeout(() => {
+    const close = (ev) => {
+      if (!menu.contains(ev.target)) { menu.remove(); document.removeEventListener('click', close); }
+    };
+    document.addEventListener('click', close);
+  }, 0);
+}
+
+// showGroupMenu 给某张卡片选分组：已有分组 / 新建 / 改名 / 删除 / 取消
+function showGroupMenu(anchor, id) {
+  document.querySelectorAll('.logo-menu').forEach((m) => m.remove());
+  const cur = markOf(id).group;
+  const gs = allGroups();
+  const menu = document.createElement('div');
+  menu.className = 'logo-menu';
+  let html = '<div class="lm-title">归入分组</div><div class="lm-rows">';
+  gs.forEach((g) => {
+    html += '<button type="button" class="lm-row' + (g === cur ? ' on' : '') + '" data-group="' + esc(g) + '">' +
+      (g === cur ? '● ' : '　') + '📁 ' + esc(g) + '</button>';
+  });
+  html += '<button type="button" class="lm-row" data-group="">' + (cur ? '　' : '● ') + '📂 未分组</button>';
+  html += '</div><div class="lm-sep"></div><div class="lm-rows">';
+  html += '<button type="button" class="lm-row" data-act="new">＋ 新建分组…</button>';
+  if (cur) {
+    html += '<button type="button" class="lm-row" data-act="rename">✎ 重命名「' + esc(cur) + '」…</button>';
+    html += '<button type="button" class="lm-row" data-act="delete">🗑 删除分组「' + esc(cur) + '」</button>';
+  }
+  html += '</div>';
+  menu.innerHTML = html;
+  placePopMenu(menu, anchor);
+  menu.addEventListener('click', (e) => {
+    const item = e.target.closest('[data-group],[data-act]');
+    if (!item) return;
+    if (item.hasAttribute('data-group')) {
+      setMark(id, { group: item.dataset.group || '' });
+    } else if (item.dataset.act === 'new') {
+      const name = prompt('新分组名称（最多 16 字）：', '');
+      if (name && name.trim()) setMark(id, { group: name.trim().slice(0, 16) });
+    } else if (item.dataset.act === 'rename') {
+      const name = prompt('把分组「' + cur + '」改名为：', cur);
+      if (name && name.trim() && name.trim() !== cur) renameGroup(cur, name.trim().slice(0, 16));
+    } else if (item.dataset.act === 'delete') {
+      if (confirm('删除分组「' + cur + '」？组内卡片会变成未分组，Key 与配置不受影响。')) renameGroup(cur, '');
+    }
+    menu.remove();
+  });
+}
+
+// grpChipHtml 分组标签（点开分组菜单）
+function grpChipHtml(id) {
+  const g = markOf(id).group;
+  return '<button class="tag grp-btn' + (g ? ' set' : '') + '" title="归入分组 / 管理分组">' +
+    (g ? '📁 ' + esc(g) : '📂 未分组') + ' ▾</button>';
+}
+
+function favBtnHtml(id) {
+  return '<button class="fav-btn' + (markOf(id).favorite ? ' on' : '') + '" title="收藏（收藏的卡片排在最前，可用「★ 收藏」筛出）">★</button>';
+}
+
+// dropMark 厂商被删除后，它的收藏/分组标记也要一起走
+function dropMark(id) {
+  const all = Object.assign({}, marks());
+  if (!(id in all)) return;
+  delete all[id];
+  state.config.marks = all;
+  saveMarksNow();
+}
+
+function groupFilterValue() {
+  const el = $('#group-filter');
+  return el ? el.value : '';
+}
+
+// renderGroupSelect 分组下拉：全部 / 未分组 / 各分组（带数量）
+function renderGroupSelect() {
+  const sel = $('#group-filter');
+  if (!sel) return;
+  const prev = sel.value;
+  const gs = allGroups();
+  let html = '<option value="">全部分组</option>';
+  if (gs.length) {
+    html += '<option value="__none">未分组</option>';
+    gs.forEach((g) => {
+      const c = Object.values(marks()).filter((m) => m && m.group === g).length;
+      html += '<option value="' + esc(g) + '">' + esc(g) + ' (' + c + ')</option>';
+    });
+  }
+  sel.innerHTML = html;
+  sel.value = Array.from(sel.options).some((o) => o.value === prev) ? prev : '';
+  sel.disabled = gs.length === 0;
+  sel.title = gs.length ? '按分组筛选' : '还没有分组：在卡片上点「📂 未分组 ▾」归入分组';
 }
 
 function ftClass(ft) {
@@ -224,6 +471,16 @@ function keyListHtml(keys, keyIndex, models, names, nos) {
     })}</div>`).join('');
 }
 
+// usageBarHtml 用量展示：填了额度就给出进度与剩余，否则只报已用 tokens
+function usageBarHtml(quota, used) {
+  if (quota > 0) {
+    const pct = Math.min(100, (used / quota) * 100);
+    return `<span class="usage">已用 ${fmt(used)} / ${fmt(quota)} tokens · 剩余 <b>${fmt(Math.max(0, quota - used))}</b></span>
+      <div class="progress"><div style="width:${pct}%"></div></div>`;
+  }
+  return `<span class="usage">已用 ${fmt(used || 0)} tokens（在「编辑」里填额度可显示剩余）</span>`;
+}
+
 function keyAreaHtml(p, k, models) {
   const keys = (k && k.api_keys && k.api_keys.length) ? k.api_keys : (k && k.api_key ? [k.api_key] : []);
   const names = (k && k.key_names) || [];
@@ -232,16 +489,9 @@ function keyAreaHtml(p, k, models) {
   const keyIndex = k ? k.key_index : 0;
   const quota = k ? k.quota : 0;
   const used = k ? k.used : 0;
-  let usageHtml;
-  if (quota > 0) {
-    const pct = Math.min(100, (used / quota) * 100);
-    usageHtml = `<span class="usage">已用 ${fmt(used)} / ${fmt(quota)} · 剩余 <b>${fmt(Math.max(0, quota - used))}</b></span>
-      <div class="progress"><div style="width:${pct}%"></div></div>`;
-  } else {
-    usageHtml = `<span class="usage">已用 ${fmt(used)} tokens</span>`;
-  }
+  const usageHtml = usageBarHtml(quota, used);
   const balanceBtn = hasKey && p.balance_url
-    ? `<button class="mini-btn btn-balance" title="查询所有 Key 的账户余额">💰 查额度</button>`
+    ? `<button class="mini-btn btn-balance" title="查询所有 Key 的账户余额（数值单位以厂商为准，不是 tokens）">💰 查余额</button>`
     : '';
   const keyHint = keys.length > 1
     ? '<div class="key-hint">拖拽左侧 ⋮⋮ 调整顺序（第一位即当前使用）；双击名称可重命名</div>'
@@ -253,7 +503,7 @@ function keyAreaHtml(p, k, models) {
     <div class="key-actions">
       <button class="mini-btn btn-add-key" title="添加更多 API Key（一个用完自动切下一个）">＋ 添加 Key</button>
       <button class="mini-btn btn-edit" title="展开编辑（Base URL / 模型列表）">编辑</button>
-      ${hasKey ? '<button class="del-mini btn-del" title="删除全部 Key">🗑</button>' : ''}
+      ${hasKey ? '<button class="del-mini btn-del" title="删除该厂商的全部配置（Key / 覆盖 / 用量）">🗑</button>' : ''}
     </div>
     <div class="key-meta">
       <div class="meta-left">${balanceBtn}${usageHtml}</div>
@@ -379,6 +629,8 @@ function builtinEditHtml(p, k) {
     <input class="e-authheader" placeholder="Authorization" value="${esc(k && k.auth_header ? k.auth_header : '')}">
     <label>前缀（留空 = 默认）</label>
     <input class="e-authprefix" placeholder="Bearer " value="${esc(k && k.auth_prefix ? k.auth_prefix : '')}">
+    <label>额度（tokens，可选）：用于显示「已用 / 剩余」进度条</label>
+    <input class="e-quota" type="number" min="0" placeholder="如 1000000" value="${k && k.quota ? k.quota : ''}">
     <div class="edit-actions">
       <button class="save-mini btn-save-edit">完成</button>
     </div>
@@ -401,6 +653,7 @@ function cardHtml(p, k, isCustom) {
   return `
   <div class="card" data-id="${esc(p.id)}" data-custom="${isCustom ? '1' : ''}">
     ${p.recommended ? '<span class="rec-badge">★ 推荐</span>' : ''}
+    ${favBtnHtml(p.id)}
     <div class="card-head">
       <div class="logo">${logoHtml(p)}</div>
       <div class="head-info">
@@ -410,6 +663,7 @@ function cardHtml(p, k, isCustom) {
           ${p.country ? `<span>${esc(p.country)}</span>` : ''}
           ${compatTag}
           ${overrideTag}${modelsTag}
+          ${grpChipHtml(p.id)}
         </div>
       </div>
     </div>
@@ -436,11 +690,12 @@ function customCardHtml(c) {
   }));
   return `
   <div class="card" data-id="${esc(c.id)}" data-custom="1">
+    ${favBtnHtml(c.id)}
     <div class="card-head">
       <div class="logo"><span class="logo-fallback">${esc(c.name.slice(0, 1))}</span></div>
       <div class="head-info">
         <div class="card-name">${esc(c.name)}</div>
-        <div class="tags"><span class="tag ft-paid">${esc(typeTag)}</span><span>· ${esc(c.base_url)}</span></div>
+        <div class="tags"><span class="tag ft-paid">${esc(typeTag)}</span><span>· ${esc(c.base_url)}</span>${grpChipHtml(c.id)}</div>
       </div>
     </div>
     <div class="chips">${(c.models || []).map((m) => {
@@ -457,7 +712,7 @@ function customCardHtml(c) {
         ${hasAnyKey(c) ? '<button class="del-mini btn-del" title="删除该自定义厂商">🗑</button>' : ''}
       </div>
       <div class="key-meta">
-        <div class="meta-left"><span class="usage">已用 ${fmt(c.used)} tokens</span></div>
+        <div class="meta-left">${usageBarHtml(c.quota, c.used)}</div>
       </div>
     </div>
     <div class="edit-area hidden">
@@ -545,11 +800,21 @@ function matchFilter(p, isCustom) {
   if (onlyKeyed && !keyed) return false;
   if (!isCustom && state.filter === 'free' && !p.free) return false;
   if (!isCustom && state.filter === 'paid' && p.free) return false;
+  const mk = markOf(p.id);
+  if (state.filter === 'fav' && !mk.favorite) return false;
+  const gf = groupFilterValue();
+  if (gf && (gf === '__none' ? mk.group !== '' : mk.group !== gf)) return false;
   if (q) {
     const models = (p.models || []).map((m) => m.id || m).join(',').toLowerCase();
-    if (!(p.name.toLowerCase().includes(q) || models.includes(q))) return false;
+    if (!(p.name.toLowerCase().includes(q) || models.includes(q) || mk.group.toLowerCase().includes(q))) return false;
   }
   return true;
+}
+
+function emptyGridMsg() {
+  if (state.filter === 'fav') return '还没有收藏。把常用厂商点上 ★，它们会排到最前面。';
+  if (groupFilterValue()) return '该分组下没有厂商。';
+  return '没有匹配的厂商';
 }
 
 function renderGrid() {
@@ -558,13 +823,18 @@ function renderGrid() {
   const paidList = cfg.providers.filter((p) => !p.free);
   $('#num-free').textContent = freeList.length;
   $('#num-paid').textContent = paidList.length;
+  $('#num-fav').textContent = favoriteCount();
+  renderGroupSelect();
 
-  const builtIn = cfg.providers.filter((p) => matchFilter(p, false));
+  // 收藏的排到最前（Array#sort 在现代引擎下稳定，未收藏的保持目录原序）
+  const favFirst = (a, b) => (markOf(b.id).favorite ? 1 : 0) - (markOf(a.id).favorite ? 1 : 0);
+  const builtIn = cfg.providers.filter((p) => matchFilter(p, false)).sort(favFirst);
   const html = builtIn.map((p) => cardHtml(p, cfg.keys[p.id], false)).join('');
 
-  const customs = (cfg.custom || []).filter((c) => matchFilter(c, true));
+  const customs = (cfg.custom || []).filter((c) => matchFilter(c, true)).sort(favFirst);
   const customGrid = $('#custom-grid');
   const customTitle = $('#custom-grid-title');
+  const pendingNew = customGrid.querySelector('.card.new-card');
   if (customs.length) {
     customTitle.classList.remove('hidden');
     customGrid.innerHTML = customs.map(customCardHtml).join('');
@@ -572,7 +842,9 @@ function renderGrid() {
     customTitle.classList.add('hidden');
     customGrid.innerHTML = '';
   }
-  $('#provider-grid').innerHTML = html || '<div class="muted">没有匹配的厂商</div>';
+  // 用户主动筛选同样不该丢掉未提交的新建表单（以前只有轮询路径做了保护）
+  if (pendingNew) customGrid.prepend(pendingNew);
+  $('#provider-grid').innerHTML = html || '<div class="muted">' + emptyGridMsg() + '</div>';
   bindCardEvents();
 }
 
@@ -662,8 +934,11 @@ function bindCardEvents(root) {
       const area = btn.closest('.key-area');
       const list = area.querySelector('.key-list');
       const card = btn.closest('.card');
-      const modelBtn = card.querySelector('.btn-test-key');
-      const model = modelBtn ? modelBtn.dataset.model : '';
+      // 新行也要能立刻测试：沿用本卡片已有 ⚡ 按钮上的模型列表（之前只传了 model，
+      // keyItemHtml 读的是 models，导致新增行没有测试按钮，要等整页重渲染才出现）
+      const testBtn = card.querySelector('.btn-test-key');
+      let models = [];
+      try { models = JSON.parse((testBtn && testBtn.dataset.models) || '[]'); } catch (e) { models = []; }
       const idx = list.querySelectorAll('.key-item').length;
       // 新 key 的序号取当前最大值 +1，不与已有 key 冲突
       let maxNo = 0;
@@ -677,7 +952,7 @@ function bindCardEvents(root) {
       div.draggable = true;
       div.dataset.keyIndex = idx;
       div.dataset.keyNo = newNo;
-      div.innerHTML = keyItemHtml(idx, '', { model, removable: true, no: newNo });
+      div.innerHTML = keyItemHtml(idx, '', { models, removable: true, no: newNo });
       list.appendChild(div);
       // 为新元素绑定事件
       bindKeyItemEvents(div);
@@ -705,9 +980,12 @@ function bindCardEvents(root) {
   scope.querySelectorAll('.btn-del').forEach((btn) => {
     btn.addEventListener('click', async () => {
       const card = btn.closest('.card');
-      if (!confirm('确认删除该厂商的所有 Key？')) return;
+      if (!confirm(card.dataset.custom === '1'
+        ? '确认删除该自定义厂商？包含它的 Key、模型列表与用量统计，不可撤销。'
+        : '确认删除该厂商在本机的全部配置？不只是 Key —— Base URL 覆盖、模型覆盖、限流、额度与已用统计都会一起删除，不可撤销。')) return;
       if (card.dataset.custom === '1') {
         await fetch('/api/custom?id=' + encodeURIComponent(card.dataset.id), { method: 'DELETE' });
+        dropMark(card.dataset.id);
       } else {
         await fetch('/api/key?provider_id=' + encodeURIComponent(card.dataset.id), { method: 'DELETE' });
       }
@@ -806,24 +1084,41 @@ function bindCardEvents(root) {
       try {
         const res = await fetch('/api/balance?provider_id=' + encodeURIComponent(id));
         const data = await res.json();
+        // 走 setResult：结果带 ✕ 可关闭。若留着不可关闭的 .test-result，
+        // hasTestResult 会恒真 → 20 秒轮询从此不刷新网格，用量/模型标签/Key 顺序全部冻住。
         if (data.keys && data.keys.length > 0) {
-          result.className = 'test-result ok';
-          const lines = data.keys.map(k => {
+          // 用与卡片行一致的稳定编号与名称，避免「Key 2」贴错人；内容逐条转义
+          const lines = data.keys.map((k) => {
             const tag = k.current ? '●' : '○';
-            if (k.ok) return `${tag} Key ${k.index + 1}: ${k.text}`;
-            return `${tag} Key ${k.index + 1}: ${k.error || '查询失败'}`;
+            const no = k.no || (k.index + 1);
+            const name = k.name ? ' ' + k.name : '';
+            return `${tag} Key ${no}${name}：${k.ok ? k.text : (k.error || '查询失败')}`;
           });
-          result.innerHTML = '💰 ' + lines.join('<br>');
+          setResult(result, 'ok', '💰 账户余额（数值单位以厂商为准，不是 tokens）',
+            lines.map((l) => esc(l)).join('<br>'));
         } else {
-          result.className = 'test-result err';
-          result.textContent = '❌ ' + (data.error || '查询失败');
+          setResult(result, 'err', '❌ ' + (data.error || '查询失败'));
         }
       } catch (e) {
-        result.className = 'test-result err';
-        result.textContent = '❌ ' + e.message;
+        setResult(result, 'err', '❌ ' + e.message);
       } finally {
         btn.disabled = false;
       }
+    });
+  });
+
+  scope.querySelectorAll('.fav-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const card = btn.closest('.card');
+      setMark(card.dataset.id, { favorite: !markOf(card.dataset.id).favorite });
+    });
+  });
+
+  scope.querySelectorAll('.grp-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      showGroupMenu(btn, btn.closest('.card').dataset.id);
     });
   });
 
@@ -1250,7 +1545,7 @@ function collectBuiltinPayload(card) {
     models,
     model_caps: modelCaps,
     model_limits: Object.keys(modelLimits).length ? modelLimits : undefined,
-    quota: cfgK.quota || 0
+    quota: quotaOf(area, open, cfgK)
   };
 }
 
@@ -1295,14 +1590,11 @@ async function saveKeys(card, silent) {
       c.model_caps = Object.keys(r.modelCaps).length ? r.modelCaps : undefined;
       c.model_limits = Object.keys(r.modelLimits).length ? r.modelLimits : undefined;
     }
-    await fetch('/api/custom', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(c) });
+    // c 就是 state.config.custom 里的那一项，已在上面就地改过；失败只需给出可见反馈
+    await postJSON('/api/custom', c, '保存失败');
   } else {
     const payload = collectBuiltinPayload(card);
-    await fetch('/api/key', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    applyBuiltinLocal(payload);
+    if (await postJSON('/api/key', payload, '保存失败')) applyBuiltinLocal(payload);
   }
   if (!silent) await fetchConfig();
 }
@@ -1314,6 +1606,8 @@ function fillBuiltinEdit(area, p, k) {
   area.querySelector('.m-rows').innerHTML = overrideRows(k, p).map((r) => modelRowHtml(r.id, r.caps, r.limit)).join('');
   area.querySelector('.e-authheader').value = k.auth_header || '';
   area.querySelector('.e-authprefix').value = k.auth_prefix || '';
+  const q = area.querySelector('.e-quota');
+  if (q) q.value = k.quota || '';
 }
 
 function fillCustomEdit(area, c) {
@@ -1334,10 +1628,7 @@ function fillCustomEdit(area, c) {
 
 async function saveBuiltinEdit(card) {
   const payload = collectBuiltinPayload(card);
-  await fetch('/api/key', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
+  if (!(await postJSON('/api/key', payload, '保存失败'))) return false;
   applyBuiltinLocal(payload);
   return true;
 }
@@ -1393,7 +1684,7 @@ async function saveCustomEdit(card, silent) {
     if (!silent) alert('请填写名称、Endpoint 和至少一个模型ID');
     return false;
   }
-  await fetch('/api/custom', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p) });
+  if (!(await postJSON('/api/custom', p, '保存失败'))) return false;
   // 已有厂商：同步内存 state，使「收起再展开」与 Key 保存看到的都是最新值
   if (id) {
     const idx = state.config.custom.findIndex((x) => x.id === id);
@@ -1420,8 +1711,10 @@ function renderModelSelect() {
     byOwner[owner].forEach((id) => { html += `<option value="${esc(id)}">${esc(id)}</option>`; });
     html += '</optgroup>';
   });
+  const prev = sel.value;
   sel.innerHTML = html;
-  sel.value = 'inurl';
+  sel.value = prev || 'inurl';
+  if (!sel.value) sel.value = 'inurl';
   applyModelFilter();
 }
 
@@ -1436,28 +1729,53 @@ function applyModelFilter() {
     });
     g.hidden = !any;
   });
+  // 搜出来的结果里没有当前选中项时，自动跟到第一个可见项：
+  // 否则界面显示的是过滤结果、发请求用的却还是隐藏着的旧值
+  const sel = $('#model-select');
+  const cur = sel.selectedOptions[0];
+  if (!cur || cur.hidden) {
+    const first = Array.from(sel.options).find((x) => !x.hidden);
+    if (first) sel.value = first.value;
+  }
 }
+
+// chatHistory 保留本轮上下文：以前每次只发一条 user 消息，
+// 连着问「它是谁」「第二段改一下」必然答非所问。
+let chatHistory = [];
+let chatAbort = null;
 
 function setupChat() {
   $('#model-search').addEventListener('input', applyModelFilter);
+  const clear = $('#btn-clear-chat');
+  if (clear) clear.addEventListener('click', () => { chatHistory = []; $('#chat-log').innerHTML = ''; });
   const send = async () => {
+    if (chatAbort) return; // 一次只跑一条，避免并发把气泡顺序搞乱
     const model = $('#model-select').value;
     const text = $('#chat-text').value.trim();
     if (!model) { alert('请选择模型'); return; }
     if (!text) return;
     addMsg('user', text);
+    chatHistory.push({ role: 'user', content: text });
     $('#chat-text').value = '';
     const msgEl = addMsg('assistant', '思考中…');
+    const btn = $('#btn-send');
+    btn.disabled = true;
+    btn.textContent = '回答中…';
+    const ctl = new AbortController();
+    chatAbort = ctl;
+    const timer = setTimeout(() => ctl.abort(), 300000);
     try {
       const maxTokens = Number($('#chat-max-tokens').value) || 128;
       const res = await fetch('/api/test', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model, max_tokens: maxTokens, messages: [{ role: 'user', content: text }] })
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: ctl.signal,
+        // 只带最近 10 条（约 5 轮），够追问又不至于撑爆上下文
+        body: JSON.stringify({ model, max_tokens: maxTokens, messages: chatHistory.slice(-10) })
       });
       const data = await res.json();
       if (!res.ok) {
         msgEl.className = 'msg error';
-        msgEl.textContent = data.error?.message || ('HTTP ' + res.status);
+        msgEl.textContent = data.error?.message || data.error || ('HTTP ' + res.status);
+        chatHistory.pop(); // 失败的一轮不留在上下文里
       } else {
         const content = data.choices?.[0]?.message?.content || '(无内容)';
         const rp = routedName(res.headers.get('X-Routed-Provider'));
@@ -1465,10 +1783,17 @@ function setupChat() {
         msgEl.textContent = rp
           ? content + '\n\n—— 由 ' + rp + ' 的 ' + rm + ' 回答'
           : content;
+        chatHistory.push({ role: 'assistant', content });
       }
     } catch (e) {
       msgEl.className = 'msg error';
-      msgEl.textContent = '请求失败: ' + e.message;
+      msgEl.textContent = ctl.signal.aborted ? '已超时或被中断，可重试或换个模型' : ('请求失败: ' + e.message);
+      chatHistory.pop();
+    } finally {
+      clearTimeout(timer);
+      chatAbort = null;
+      btn.disabled = false;
+      btn.textContent = '发送';
     }
   };
   $('#btn-send').addEventListener('click', send);
@@ -1487,11 +1812,35 @@ function addMsg(role, text) {
 }
 
 // ---------- 设置 ----------
+// runningPort 本次进程实际在监听的端口（改了配置不重启就用不上）
+let runningPort = 3003;
+
 function renderSettings() {
   const s = state.config.settings || {};
   $('#set-autostart').checked = !!state.config.autostart;
   $('#set-port').value = s.proxy_port || 3003;
-  $('#status-addr').textContent = 'http://localhost:' + (s.proxy_port || 3003) + '/v1';
+  const port = s.proxy_port || 3003;
+  $('#status-addr').textContent = 'http://localhost:' + port + '/v1';
+  // 底部示例里的端口以前硬编码 3003，改了端口就一直教错人
+  $$('.js-port').forEach((el) => { el.textContent = String(port); });
+  const tip = $('#port-restart-tip');
+  if (tip) tip.classList.toggle('hidden', String(port) === String(runningPort));
+}
+
+// restartApp 重启整个程序（与托盘「重启」同一路径）：改端口后不必再去翻托盘
+async function restartApp() {
+  if (!confirm('需要重启 ApiCluster 才能让新端口生效。现在重启？\n（会短暂断开正在进行的请求）')) return;
+  const btn = $('#btn-restart-app');
+  if (btn) { btn.disabled = true; btn.textContent = '正在重启…'; }
+  try {
+    const res = await fetch('/api/restart', { method: 'POST' });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) toast('❌ ' + (d.error || ('HTTP ' + res.status)), true);
+    else toast('正在重启，窗口几秒后重新出现…');
+  } catch (e) {
+    toast('❌ 重启失败：' + e.message, true);
+  }
+  if (btn) { btn.disabled = false; btn.textContent = '重启程序'; }
 }
 
 function renderStatus() {
@@ -1505,18 +1854,38 @@ function setupSettings() {
     const s = {
       autostart: $('#set-autostart').checked,
       proxy_port: Number($('#set-port').value) || 3003,
-      auto_open_browser: false,
+      // 这两项设置页没有控件，必须把服务端现值原样带回去（以前硬写 false，
+      // 用户在别处改的「自动打开管理界面」会被这里悄悄抹掉）
+      auto_open_browser: cur.auto_open_browser !== false,
       auto_route_enabled: cur.auto_route_enabled !== false,
       auto_models: cur.auto_models || '',
       auto_provider_order: cur.auto_provider_order || ''
     };
-    await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(s) });
+    let d;
+    try {
+      const res = await fetch('/api/settings', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(s)
+      });
+      d = await res.json().catch(() => ({}));
+      if (!res.ok) { toast('保存失败：' + (d.error || ('HTTP ' + res.status)), true); return; }
+    } catch (e) {
+      toast('保存失败：' + e.message, true);
+      return;
+    }
+    if (d.autostart !== undefined) state.config.autostart = d.autostart;
+    // renderSettings 是从 state.config.settings 回读输入框的，不同步就会拿旧值把用户刚填的盖回去
+    state.config.settings = Object.assign({}, state.config.settings || {}, s);
+    // 用服务端回的真实监听端口，才能判断「配置已改但还没重启」
+    if (d.running_port) runningPort = d.running_port;
+    renderSettings();
     const hint = $('#settings-hint');
-    if (hint) { hint.textContent = '✓ 已自动保存。修改端口后需重启程序生效。'; setTimeout(() => { hint.textContent = ''; }, 3000); }
+    if (hint) { hint.textContent = '✓ 已保存。修改端口后需重启程序生效。'; setTimeout(() => { hint.textContent = '修改自动保存'; }, 4000); }
   }, 600);
 
   $('#set-autostart').addEventListener('change', save);
   $('#set-port').addEventListener('input', save);
+  const rb = $('#btn-restart-app');
+  if (rb) rb.addEventListener('click', restartApp);
 }
 
 // ---------- 自动路由配置（方案） ----------
@@ -1580,6 +1949,13 @@ function schemeLogoHtml(info) {
   return `<span class="s-logo"><span class="logo-fallback">${esc((info.provider || '?').slice(0, 1))}</span></span>`;
 }
 
+// capsReadonlyHtml 方案行里的能力只做展示：这些勾选过去完全不参与路由（纯装饰），
+// 会误导用户以为在这里能改分流。真正的开关在厂商卡片的编辑区（model_caps）。
+function capsReadonlyHtml(caps) {
+  return (caps && caps.length ? caps : ['text']).map((c) =>
+    `<span class="cap-tag cap-${esc(c)}">${CAP_LABELS[c] || c}</span>`).join('');
+}
+
 // capTogglesHtml 渲染可点击切换的能力标签（选中高亮），让用户自己决定模型支持哪些能力
 function capTogglesHtml(selected) {
   const sel = new Set((selected && selected.length) ? selected : ['text']);
@@ -1597,12 +1973,12 @@ function renderRouteConfig() {
 function schemeModelRow(mid, caps) {
   const info = modelInfo(mid);
   const selected = (caps && caps.length) ? caps : (info ? info.caps : ['text']);
-  return `<div class="s-model" draggable="true" data-model="${esc(mid)}">
+  return `<div class="s-model${info ? '' : ' stale'}" draggable="true" data-model="${esc(mid)}" title="${info ? '' : '该模型当前没有已配 Key 的厂商，路由时会被跳过'}">
     <span class="drag-handle" title="拖拽排序">⋮⋮</span>
     ${schemeLogoHtml(info)}
     <span class="s-model-name">${esc(mid)}</span>
-    ${info ? `<span class="s-provider">${esc(info.provider)}</span>` : ''}
-    <span class="s-caps">${capTogglesHtml(selected)}</span>
+    ${info ? `<span class="s-provider">${esc(info.provider)}</span>` : '<span class="s-stale-tag">未配 Key</span>'}
+    <span class="s-caps" title="这里只展示能力；要改请在「密钥库」该厂商的编辑区里改模型支持类型">${capsReadonlyHtml(selected)}</span>
     <button class="mini-btn s-model-del" title="移除该模型">✕</button>
   </div>`;
 }
@@ -1627,16 +2003,27 @@ function schemeHtml(sc) {
     </div>
     <div class="scheme-models">${models}
       <div class="s-add">
-        <select class="s-add-select"><option value="">＋ 添加已配 Key 的模型…</option>${schemeModelOptions(sc)}</select>
+        <select class="s-add-select"><option value="">${keyedModels().length ? '＋ 添加已配 Key 的模型…' : '＋ 没有可选模型：先去密钥库给厂商填 Key…'}</option>${schemeModelOptions(sc)}</select>
       </div>
     </div>
     <div class="scheme-test-result"></div>
   </div>`;
 }
 
+// routeBusy 正在方案区里编辑、或正看着某条测试结果时，不重建方案列表：
+// 以前 20 秒轮询会把手工加进去但还没落库的模型行/测试结果直接抹掉。
+function routeBusy() {
+  const list = $('#scheme-list');
+  if (!list) return false;
+  const ae = document.activeElement;
+  if (ae && list.contains(ae)) return true;
+  return Array.from(list.querySelectorAll('.scheme-test-result')).some((el) => el.textContent.trim());
+}
+
 function renderSchemes() {
   const list = $('#scheme-list');
   if (!list) return;
+  if (routeBusy()) return;
   const schemes = state.config.schemes || [];
   if (!schemes.length) {
     list.innerHTML = '<div class="muted">还没有方案。点击右上角「＋ 新建方案」，填一个名字（客户端把 model 填成该名字），再添加模型。</div>';
@@ -1720,27 +2107,41 @@ function bindSchemeDrag(list) {
 async function saveSchemesSilent() {
   const schemes = collectSchemes();
   state.config.schemes = schemes;
-  // 方案名有空或重复时跳过保存（等用户填好/改好再存）
+  // 逐张卡判定，坏的那张不提交并标红：以前「任意一张名为空或重名」会整批 return，
+  // 用户改好另一张却以为自己所有改动都存了。
   const seen = new Set();
-  for (const sc of schemes) {
-    if (!sc.name) return;
-    if (seen.has(sc.name)) return;
-    seen.add(sc.name);
+  const valid = [];
+  let badMsg = '';
+  schemes.forEach((sc, i) => {
+    const why = schemeBad(sc, seen);
+    const card = $$('#scheme-list .scheme-card')[i];
+    if (card) card.classList.toggle('bad', !!why);
+    if (why) { if (!badMsg) badMsg = why; return; }
+    seen.add(sc.name.toLowerCase());
+    valid.push(sc);
+  });
+  const hint = $('#route-hint');
+  if (badMsg && hint) { hint.textContent = '⚠ ' + badMsg + '（其余方案已保存）'; hint.style.color = 'var(--red)'; }
+  if (!valid.length && !schemes.length) {
+    try { await fetch('/api/schemes', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '[]' }); } catch (e) {}
+    return;
   }
+  if (!valid.length) return;
   try {
-    await fetch('/api/schemes', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(schemes) });
-    const hint = $('#route-hint');
-    if (hint) { hint.textContent = '✓ 已自动保存'; setTimeout(() => { hint.textContent = ''; }, 2000); }
+    await fetch('/api/schemes', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(valid) });
+    const h2 = $('#route-hint');
+    if (h2 && !badMsg) { h2.textContent = '✓ 已自动保存'; h2.style.color = ''; setTimeout(() => { h2.textContent = '修改自动保存'; }, 2000); }
   } catch (e) { /* 忽略 */ }
 }
 
 // collectSchemes 按 DOM 顺序收集方案（含每个模型手动选择的能力）
 function collectSchemes() {
   return Array.from($$('#scheme-list .scheme-card')).map((card) => {
+    // 能力标签以厂商实际配置为准（以前的手勾 caps 完全不参与路由，留着只会误导）
     const caps = {};
     card.querySelectorAll('.s-model').forEach((m) => {
-      const sel = Array.from(m.querySelectorAll('.cap-chip.on')).map((c) => c.dataset.cap);
-      caps[m.dataset.model] = sel.length ? sel : ['text'];
+      const info = modelInfo(m.dataset.model);
+      if (info && info.caps) caps[m.dataset.model] = info.caps;
     });
     return {
       id: card.dataset.id,
@@ -1813,8 +2214,7 @@ function setupRouteConfig() {
     if (delModel) { delModel.closest('.s-model').remove(); saveSchemesSilent(); return; }
     const testBtn = e.target.closest('.s-test');
     if (testBtn) { await testScheme(testBtn); return; }
-    const capChip = e.target.closest('.cap-chip');
-    if (capChip) { capChip.classList.toggle('on'); saveSchemesSilent(); return; }
+    // 方案里的能力标签是只读展示（要改去厂商卡片编辑区），此处不再处理点击
   });
 
   // 方案名输入 / 启用开关变化 → 防抖自动保存
@@ -1835,16 +2235,28 @@ function setupRouteConfig() {
     row.draggable = true;
     row.dataset.model = sel.value;
     const info = modelInfo(sel.value);
+    row.classList.toggle('stale', !info);
     row.innerHTML = `<span class="drag-handle" title="拖拽排序">⋮⋮</span>
       ${schemeLogoHtml(info)}
       <span class="s-model-name">${esc(sel.value)}</span>
-      ${info ? `<span class="s-provider">${esc(info.provider)}</span>` : ''}
-      <span class="s-caps">${capTogglesHtml(info ? info.caps : ['text'])}</span>
+      ${info ? `<span class="s-provider">${esc(info.provider)}</span>` : '<span class="s-stale-tag">未配 Key</span>'}
+      <span class="s-caps" title="只展示能力；要改请到「密钥库」该厂商的编辑区">${capsReadonlyHtml(info ? info.caps : ['text'])}</span>
       <button class="mini-btn s-model-del" title="移除">✕</button>`;
     modelsEl.insertBefore(row, sel.closest('.s-add'));
     sel.value = '';
     saveSchemesSilent();
   });
+}
+
+// 内置能力别名：方案若与它们同名会静默顶掉别名（路由时方案优先），必须拒绝
+const RESERVED_SCHEME_NAMES = ['inurl', 'inurl-text', 'inurl-code', 'inurl-image', 'inurl-video', 'inurl-audio', 'auto', 'default'];
+
+function schemeBad(sc, seen) {
+  if (!sc.name) return '方案名还没填';
+  if (seen.has(sc.name.toLowerCase())) return '方案名重复';
+  if (RESERVED_SCHEME_NAMES.indexOf(sc.name.toLowerCase()) >= 0) return '方案名占了内置别名（inurl 等）';
+  if (!sc.models.length) return '还没有添加模型';
+  return '';
 }
 
 // debouncedSaveSchemes 方案名/开关变化的防抖保存
@@ -2267,15 +2679,7 @@ function showLogoMenu(anchor, card) {
     <button type="button" class="lm-row" data-act="favicon">🔗 按网址自动取该站图标</button>
     <button type="button" class="lm-row" data-act="upload">🖼️ 上传图片（也可直接拖到图标上）</button>
     <button type="button" class="lm-row" data-act="none">🔤 用名称首字母</button>`;
-  document.body.appendChild(menu);
-  // 靠边/靠底的卡片要把菜单翻到上方并收进视口，否则「上传图片」那几行会被屏幕裁掉
-  const r = anchor.getBoundingClientRect();
-  const mh = menu.offsetHeight, mw = menu.offsetWidth;
-  let top = r.bottom + 6;
-  if (top + mh > innerHeight - 8) top = Math.max(8, r.top - mh - 6);
-  let left = Math.min(r.left, innerWidth - mw - 12);
-  menu.style.top = top + 'px';
-  menu.style.left = Math.max(8, left) + 'px';
+  placePopMenu(menu, anchor);
   menu.addEventListener('click', (e) => {
     const item = e.target.closest('[data-logo],[data-act]');
     if (!item) return;
@@ -2463,6 +2867,7 @@ function setupTabs() {
   });
   $('#search-provider').addEventListener('input', renderGrid);
   $('#only-keyed').addEventListener('change', renderGrid);
+  $('#group-filter').addEventListener('change', renderGrid);
   $('#btn-add-custom').addEventListener('click', () => {
     $('#custom-grid-title').classList.remove('hidden');
     const grid = $('#custom-grid');
@@ -2513,14 +2918,20 @@ function setupTheme() {
 }
 
 // 跟随 LifeSystem 主题（内嵌时轮询 /api/theme 同步文件）
+let lastLifeTheme = null;
+
+// syncLifeTheme 被 LifeSystem 内嵌时跟随它的主题。
+// 只在「那边真的变了」时动手：以前每 1.5 秒无条件掰一次，
+// 用户在 ApiCluster 里手动点深色/浅色，1.5 秒后就被打回原形。
 async function syncLifeTheme() {
   try {
     const res = await fetch('/api/theme');
     if (!res.ok) return;
     const data = await res.json();
-    if (data.theme === 'dark' || data.theme === 'light') {
-      if (currentTheme() !== data.theme) applyTheme(data.theme);
-    }
+    if (data.theme !== 'dark' && data.theme !== 'light') return;
+    if (data.theme === lastLifeTheme) return;
+    lastLifeTheme = data.theme;
+    if (currentTheme() !== data.theme) applyTheme(data.theme);
   } catch (e) {}
 }
 
@@ -2562,8 +2973,9 @@ async function cliMgmt(path, method, body) {
     const text = await res.text();
     let data;
     try { data = JSON.parse(text); } catch (e) { data = { raw: text }; }
-    // 401 = 管理密钥与边车 config.yaml 里的哈希不是同一把，提示一键修复
-    setCliAuthFailed(res.status === 401);
+    // 401 = 管理密钥与边车 config.yaml 里的哈希不是同一把，提示一键修复；
+    // 其它失败（502 抖动、未启动）不动这个标记，免得修复条一闪就没
+    if (res.status === 401) setCliAuthFailed(true);
     return { ok: res.ok, status: res.status, data };
   } catch (e) {
     return { ok: false, status: 0, data: { error: e.message } };
@@ -2580,7 +2992,7 @@ function setCliAuthFailed(failed) {
 }
 
 function renderKeyBanner() {
-  $$('.key-banner').forEach((el) => {
+  $$('.js-auth-banner').forEach((el) => {
     if (!cliAuthFailed) {
       el.classList.add('hidden');
       el.innerHTML = '';
@@ -2628,6 +3040,43 @@ async function fixCliKey() {
   return msg;
 }
 
+// renderOrphanBanner 端口上残留一台不归当前 ApiCluster 管的边车时必须说出来：
+// 否则界面按「我有没有启动它」显示成已停止，而端口实际还在被用。
+function renderOrphanBanner(orphan, running) {
+  const el = $('#cli-orphan-banner');
+  if (!el) return;
+  if (!orphan || !orphan.port_busy || running) {
+    el.classList.add('hidden');
+    el.innerHTML = '';
+    return;
+  }
+  el.classList.remove('hidden');
+  el.innerHTML = '<span>⚠ 端口 ' + orphan.port + ' 上确实有边车在跑（PID ' + orphan.pid +
+    (orphan.name ? '，' + esc(orphan.name) : '') + '），但它不是当前 ApiCluster 启动的' +
+    (orphan.ours ? '（是上一轮被强杀后残留的自家实例）' : '（可能是你自己另开的一份 CLIProxyAPI）') +
+    '，所以这里显示「已停止」。' +
+    (orphan.ours ? '' : '要么在下方换一个端口，要么自行处理该进程；确认是残留实例时这里才能替你结束它。') +
+    '</span>' + (orphan.ours ? '<button class="mini-btn btn-kill-orphan" type="button">结束残留进程</button>' : '');
+}
+
+async function killCliOrphan(btn) {
+  if (btn) { btn.disabled = true; btn.textContent = '结束中…'; }
+  const box = $('#cli-status-error');
+  try {
+    const res = await fetch('/api/cliproxy/kill-orphan', { method: 'POST' });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error) {
+      if (box) { box.dataset.busy = '1'; box.textContent = '❌ ' + (data.error || '结束失败'); }
+    } else if (box) {
+      box.textContent = '';
+    }
+  } catch (e) {
+    if (box) box.textContent = '❌ ' + e.message;
+  }
+  await fetchCliStatus();
+  await fetchCliAccounts();
+}
+
 async function fetchCliStatus() {
   try {
     const res = await fetch('/api/cliproxy/status');
@@ -2642,6 +3091,7 @@ function renderCliStatus(d) {
   const ready = !!st.ready;
   cliRunning = ready;
   setCliAuthFailed(!!st.auth_failed); // 密钥失配时在页面上挂出「一键修复」条
+  renderOrphanBanner(d.orphan, running);
   const dot = $('#cli-dot');
   dot.classList.toggle('on', ready);
   dot.classList.toggle('warn', running && !ready);
@@ -2668,7 +3118,9 @@ function renderCliStatus(d) {
   ).join('');
 
   $('#cli-endpoints').innerHTML = (d.endpoints || []).map((e) =>
-    `<div class="cli-ep"><span class="cli-ep-name">${esc(e.name)}</span><code>${esc(e.path)}</code><span class="muted">${esc(e.note)}</span></div>`
+    `<div class="cli-ep"><span class="cli-ep-name">${esc(e.name)}</span><code>${esc(e.path)}</code>` +
+    `<span class="muted ep-note">${esc(e.note)}</span>` +
+    `<button class="eye-mini btn-ep-copy" data-url="${esc(e.path)}" title="复制这个 Base URL，粘给客户端">📋</button></div>`
   ).join('');
   $('#cli-apikey').textContent = st.api_key || '-';
   $('#cli-mgmtkey').textContent = st.mgmt_key || '-';
@@ -2690,9 +3142,24 @@ function renderCliStatus(d) {
   $('#cli-exepath').placeholder = st.exe_path ? ('自动查找：' + st.exe_path) : '自动查找';
 }
 
+// cliBusy 启停过程中禁用这三个按钮：连点会让状态与进程来回打架
+let cliBusy = false;
+
+function setCliBusy(on, label) {
+  cliBusy = on;
+  [['#cli-start', '启动'], ['#cli-stop', '停止'], ['#cli-restart', '重启']].forEach(([sel, text]) => {
+    const b = $(sel);
+    if (!b) return;
+    b.disabled = on;
+    b.textContent = on && b.textContent.includes(label) ? text + '中…' : text;
+  });
+}
+
 async function cliAction(action) {
+  if (cliBusy) return;
   const errBox = $('#cli-status-error');
   const label = { start: '启动', stop: '停止', restart: '重启' }[action] || action;
+  setCliBusy(true, label);
   errBox.dataset.busy = '1';
   errBox.textContent = '正在' + label + '…';
   try {
@@ -2707,9 +3174,20 @@ async function cliAction(action) {
     errBox.textContent = '❌ ' + e.message;
   } finally {
     delete errBox.dataset.busy;
+    setCliBusy(false);
+  }
+  // 边车停了以后，内嵌面板那张 iframe 会留在一个连不上的错误页上，直接清掉更诚实
+  if (action === 'stop') {
+    const frame = $('#cli-panel-frame');
+    if (frame) {
+      frame.removeAttribute('src');
+      cliPanelUrl = '';
+      $('#cli-panel-hint').textContent = '订阅账号服务已停止，面板也随之不可用；要看面板点上方「启动」或「🌐 管理面板」。';
+    }
   }
   await fetchCliStatus();
   await fetchCliAccounts();
+  await fetchCliLog();
 }
 
 let cliPanelUrl = '';
@@ -2758,6 +3236,9 @@ async function loadCliPanel() {
     hint.innerHTML = '面板已内嵌加载' + (data.pid ? '（边车运行中，PID ' + esc(data.pid) + '）' : '') +
       '。首次使用需登录：管理密钥已复制到剪贴板，在面板登录框 Ctrl+V 粘贴即可。';
     if (data.mgmt_key) await copyText(data.mgmt_key);
+    // 面板里那些请求是 iframe 直连边车的，密钥失配时 ApiCluster 并不知道；
+    // 这里替它探一次，好在面板页上方也挂出「一键修复」条
+    await cliMgmt('/auth-files', 'GET');
   } catch (e) {
     hint.textContent = '❌ 打开管理面板失败: ' + e.message;
   }
@@ -2915,16 +3396,36 @@ async function cliAccountAction(act, name, disabled, btn) {
 }
 
 async function fetchCliLog() {
+  const el = $('#cli-log');
+  if (!el) return;
   try {
+    // 用户在往上翻着看时不要把滚动条抢回底部
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
     const res = await fetch('/api/cliproxy/log?lines=200');
     const txt = await res.text();
-    const el = $('#cli-log');
     el.textContent = txt.trim() ? txt : '（暂无日志）';
-    el.scrollTop = el.scrollHeight;
+    if (atBottom) el.scrollTop = el.scrollHeight;
   } catch (e) { /* 忽略 */ }
 }
 
 let cliSettingsDirty = false;
+
+// browseCliExe 用系统文件对话框挑 CLIProxyAPI.exe（和「远程隧道 → 浏览私钥」同一套做法），
+// 省得手动敲一长串路径。
+async function browseCliExe() {
+  const hint = $('#cli-settings-hint');
+  try {
+    const res = await fetch('/api/cliproxy/browse-exe', { method: 'POST' });
+    const data = await res.json().catch(() => ({}));
+    if (data.cancelled) return;
+    if (!res.ok || !data.path) { hint.textContent = '❌ ' + (data.error || ('HTTP ' + res.status)); return; }
+    $('#cli-exepath').value = data.path;
+    cliSettingsDirty = true;
+    await saveCliSettings();
+  } catch (e) {
+    hint.textContent = '❌ ' + e.message;
+  }
+}
 
 async function saveCliSettings() {
   const body = {
@@ -2937,12 +3438,15 @@ async function saveCliSettings() {
     const res = await fetch('/api/cliproxy/settings', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
     });
+    const d = await res.json().catch(() => ({}));
     if (res.ok) {
       cliSettingsDirty = false;
-      hint.textContent = '✓ 已保存。修改端口后请点上方「重启」生效。';
-      setTimeout(() => { hint.textContent = ''; }, 4000);
+      // 关掉常驻会顺带停掉正在跑的边车，这件事必须说出口，别让人以为它还在跑
+      hint.textContent = d.stopped
+        ? '✓ 已保存：不再随启动常驻，并已停止当前正在跑的边车（要再用点上方「启动」）。'
+        : '✓ 已保存。修改端口后请点上方「重启」生效。';
+      setTimeout(() => { hint.textContent = '修改自动保存'; }, 5000);
     } else {
-      const d = await res.json();
       hint.textContent = '❌ ' + (d.error || ('HTTP ' + res.status));
     }
   } catch (e) {
@@ -2981,9 +3485,28 @@ function setupCliProxy() {
   $('#cli-refresh-accounts').addEventListener('click', fetchCliAccounts);
   $('#cli-refresh-log').addEventListener('click', fetchCliLog);
   $('#cli-fix-key').addEventListener('click', fixCliKey);
-  // 修复条与「启动并加载面板」都是动态生成的，用委托绑定
+  // 复制 Base URL / 本地 API Key / 管理密钥
+  $('#cli-endpoints').addEventListener('click', (e) => {
+    const b = e.target.closest('.btn-ep-copy');
+    if (b) copyTo(b, b.dataset.url);
+  });
+  $('#cli-copy-key').addEventListener('click', async (e) => {
+    const v = $('#cli-apikey').textContent;
+    await copyTo(e.currentTarget, v === '-' ? '' : v);
+  });
+  $('#cli-copy-mgmtkey').addEventListener('click', async (e) => {
+    const v = $('#cli-mgmtkey').textContent;
+    if (v === '-' || !v) return;
+    const ok = await copyTo(e.currentTarget, v);
+    if (ok) alert('管理密钥已复制到剪贴板，在管理面板登录框 Ctrl+V 粘贴即可。');
+    else alert('复制失败，请手动选中上方密钥文本复制。');
+  });
+  $('#cli-browse-exe').addEventListener('click', browseCliExe);
+  // 修复条、「启动并加载面板」、「结束残留进程」都是动态生成的，用委托绑定
   document.addEventListener('click', (e) => {
     if (e.target.closest('.btn-fix-key')) { fixCliKey(); return; }
+    const ko = e.target.closest('.btn-kill-orphan');
+    if (ko) { killCliOrphan(ko); return; }
     if (e.target.closest('.btn-panel-start')) startPanelSidecar();
   });
   // CLI 设置变化即自动保存（防抖）
@@ -2993,39 +3516,91 @@ function setupCliProxy() {
     el.addEventListener('input', () => { cliSettingsDirty = true; debouncedSaveCli(); });
     el.addEventListener('change', () => { cliSettingsDirty = true; debouncedSaveCli(); });
   });
-  $('#cli-copy-key').addEventListener('click', async () => {
-    const v = $('#cli-apikey').textContent;
-    if (!v || v === '-') return;
-    await copyText(v);
-  });
-  $('#cli-copy-mgmtkey').addEventListener('click', async () => {
-    const v = $('#cli-mgmtkey').textContent;
-    if (!v || v === '-') return;
-    const ok = await copyText(v);
-    alert(ok ? '管理密钥已复制到剪贴板，在管理面板登录框 Ctrl+V 粘贴即可。' : '复制失败，请手动选中密钥文本复制。\n\n' + v);
-  });
 
   fetchCliStatus();
   fetchCliAccounts();
   fetchCliLog();
+  // 停在本页时状态、账号列表（含冷却/禁用态）和日志一起刷，不用手点刷新
   setInterval(() => {
     const panel = $('#tab-cliproxy');
-    if (panel && panel.classList.contains('active')) fetchCliStatus();
+    if (!panel || !panel.classList.contains('active')) return;
+    fetchCliStatus();
+    fetchCliAccounts();
+    fetchCliLog();
   }, 5000);
 }
 
 // ---------- 远程隧道（SSH 反向隧道） ----------
 let tunSettingsDirty = false;
 
+// renderTunOrphans 有「像我们这条隧道但不是当前管理器起的」ssh 进程时提示出来：
+// 这种残留会在远程占着端口转发，新隧道就会反复 remote port forwarding failed，
+// 而界面上只显示「已断开」，谁都看不出原因。
+function renderTunOrphans(orphans, running) {
+  const box = $('#tun-orphan-banner');
+  if (!box) return;
+  const list = (orphans || []).filter((x) => x && x.pid);
+  if (!list.length) { box.classList.add('hidden'); box.innerHTML = ''; return; }
+  box.classList.remove('hidden');
+  box.innerHTML = '<span>⚠ 检测到 ' + list.length + ' 个与当前隧道参数相同的 ssh 进程'
+    + (running ? '（不是本程序启动的那条）' : '')
+    + '：' + list.map((x) => 'PID ' + esc(x.pid) + (x.ours ? '（上一轮遗留）' : '')).join('、')
+    + '。它们会在服务器上占着端口。'
+    + list.map((x) => '<button class="mini-btn btn-tun-kill" data-pid="' + esc(x.pid) + '" type="button">结束 ' + esc(x.pid) + '</button>').join('');
+}
+
+async function killTunOrphan(btn) {
+  const pid = Number(btn.dataset.pid);
+  if (!pid) return;
+  if (!confirm('结束 PID ' + pid + '？\n后端会再核对一次命令行，确认是这条隧道的进程才会动手。')) return;
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/tunnel/kill-orphan', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pid })
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok || d.error) toast('❌ ' + (d.error || '结束失败'), true);
+    else toast('已结束 PID ' + pid);
+  } catch (e) {
+    toast('❌ ' + e.message, true);
+  }
+  await fetchTunnelStatus();
+}
+
+// probeTunnel 让远程那侧自己回话：ssh 进程活着 ≠ 反向端口真的能访问
+async function probeTunnel(btn) {
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = '探测中…';
+  const out = $('#tun-probe-result');
+  if (out) out.textContent = '';
+  try {
+    const res = await fetch('/api/tunnel/probe', { method: 'POST' });
+    const d = await res.json().catch(() => ({}));
+    if (out) {
+      out.textContent = d.ok
+        ? '✅ 远程 127.0.0.1:' + d.remote_port + ' 可访问' + (d.http && d.http !== 'OPEN' ? '（healthz HTTP ' + d.http + '）' : '')
+        : '❌ ' + (d.error || '探测失败');
+      out.classList.toggle('bad', !d.ok);
+    }
+  } catch (e) {
+    if (out) { out.textContent = '❌ 探测请求失败：' + e.message; out.classList.add('bad'); }
+  }
+  btn.disabled = false;
+  btn.textContent = old;
+}
+
 async function fetchTunnelStatus() {
   try {
     const res = await fetch('/api/tunnel/status');
     if (!res.ok) return;
-    renderTunnelStatus((await res.json()).status || {});
+    const body = await res.json();
+    renderTunnelStatus(body.status || {}, body);
   } catch (e) { /* 忽略 */ }
 }
 
-function renderTunnelStatus(st) {
+function renderTunnelStatus(st, body) {
+  body = body || {};
   const running = !!st.running;
   const ready = !!st.ready;
   const dot = $('#tun-dot');
@@ -3034,10 +3609,21 @@ function renderTunnelStatus(st) {
   $('#tun-status-text').textContent = ready ? '隧道已建立' : (running ? '连接中…' : '已断开');
   const sub = $('#tun-status-sub');
   if (ready && st.remote_url) {
-    sub.textContent = '远程访问：' + st.remote_url;
+    // 「localhost」是相对于远程那台机器而言的，写死容易被误读成本机地址
+    sub.textContent = '在远程机器上访问：' + st.remote_url + '（不是你这台电脑）';
   } else {
     sub.textContent = st.pem_path && st.host ? ('目标：' + st.user + '@' + st.host) : '尚未配置';
   }
+  // 改了端口/主机但没重启隧道时，必须说清楚界面显示的是「启动那一刻生效的值」
+  const drift = $('#tun-drift');
+  if (drift) {
+    drift.classList.toggle('hidden', !st.needs_restart);
+    if (st.needs_restart) {
+      drift.innerHTML = '<span>⚠ 配置已修改，但隧道还在用启动时的旧参数（上面的端口/主机即实际生效值）。'
+        + '点右上「重启」才会切过去。</span>';
+    }
+  }
+  renderTunOrphans(body.orphans, !!st.running);
   const errBox = $('#tun-status-error');
   if (st.last_error) {
     errBox.textContent = '⚠ ' + st.last_error;
@@ -3176,9 +3762,18 @@ function setupTunnel() {
 
   fetchTunnelStatus();
   fetchTunnelLog();
+  document.addEventListener('click', (e) => {
+    const k = e.target.closest('.btn-tun-kill');
+    if (k) killTunOrphan(k);
+  });
+  const probe = $('#tun-probe');
+  if (probe) probe.addEventListener('click', () => probeTunnel(probe));
+  // 停在本页时状态、日志一起刷：断线原因不该只躺在文件里
   setInterval(() => {
     const panel = $('#tab-tunnel');
-    if (panel && panel.classList.contains('active')) fetchTunnelStatus();
+    if (!panel || !panel.classList.contains('active')) return;
+    fetchTunnelStatus();
+    fetchTunnelLog();
   }, 5000);
 }
 

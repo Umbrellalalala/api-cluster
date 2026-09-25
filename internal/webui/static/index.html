@@ -7,7 +7,7 @@
   <script>
     (function(){try{var t=localStorage.getItem('theme');if(t==='dark'){document.documentElement.setAttribute('data-theme','dark');}}catch(e){}})();
   </script>
-  <link rel="stylesheet" href="style.css?v=20260923a">
+  <link rel="stylesheet" href="style.css?v=20260926a">
 </head>
 <body>
   <div class="layout">
@@ -44,12 +44,14 @@
           <button class="btn primary" id="btn-add-custom">＋ 自定义厂商</button>
         </div>
         <div class="filters">
-          <input type="search" id="search-provider" placeholder="搜索厂商 / 模型…">
+          <input type="search" id="search-provider" placeholder="搜索厂商 / 模型 / 分组…">
+          <select id="group-filter" class="group-select" title="按分组筛选"></select>
           <label class="check"><input type="checkbox" id="only-keyed"> 只看已填 Key</label>
         </div>
         <div class="pill-tabs">
           <button class="pill active" data-filter="free">免费模型 <span class="pill-num" id="num-free">0</span></button>
           <button class="pill" data-filter="paid">付费模型 <span class="pill-num" id="num-paid">0</span></button>
+          <button class="pill" data-filter="fav">★ 收藏 <span class="pill-num" id="num-fav">0</span></button>
         </div>
         <div id="provider-grid" class="grid"></div>
         <div id="custom-grid-title" class="group-title hidden">自定义厂商</div>
@@ -127,7 +129,8 @@
           <div class="cli-grid" id="cli-status-grid"></div>
           <div class="muted hint" id="cli-status-error"></div>
         </div>
-        <div class="key-banner hidden"></div>
+        <div class="key-banner hidden js-auth-banner"></div>
+        <div class="key-banner hidden" id="cli-orphan-banner"></div>
 
         <div class="route-block">
           <div class="route-head">
@@ -185,7 +188,10 @@
               <div class="setting-title">CLIProxyAPI.exe 路径</div>
               <div class="muted">留空 = 自动在 ApiCluster.exe 同目录查找</div>
             </div>
-            <input type="text" id="cli-exepath" class="port-input" placeholder="自动查找">
+            <div class="cli-path-row">
+              <input type="text" id="cli-exepath" class="port-input" placeholder="自动查找">
+              <button class="mini-btn" id="cli-browse-exe" title="从文件对话框里选 CLIProxyAPI.exe">浏览…</button>
+            </div>
           </div>
           <div class="muted hint" id="cli-settings-hint">修改自动保存</div>
         </div>
@@ -211,7 +217,7 @@
         <div class="muted" id="cli-panel-hint" style="margin-bottom:10px">
           面板首次加载可能需要联网下载资源，请稍候…
         </div>
-        <div class="key-banner hidden"></div>
+        <div class="key-banner hidden js-auth-banner"></div>
         <iframe id="cli-panel-frame" class="panel-frame" title="CLIProxyAPI 管理面板"></iframe>
       </section>
 
@@ -220,11 +226,15 @@
         <div class="page-head">
           <h1>远程隧道</h1>
           <div class="cli-actions">
+            <button class="mini-btn" id="tun-probe" title="登录远程机器，看它本地的端口是不是真能访问本机代理">🔌 测一下远程能否访问</button>
             <button class="mini-btn" id="tun-start">启动</button>
             <button class="mini-btn" id="tun-stop">停止</button>
             <button class="mini-btn" id="tun-restart">重启</button>
           </div>
         </div>
+        <div class="muted hint" id="tun-probe-result"></div>
+        <div class="key-banner hidden" id="tun-drift"></div>
+        <div class="key-banner hidden" id="tun-orphan-banner"></div>
         <div class="muted cli-desc">
           通过 SSH 反向隧道，让远程服务器（如 203.0.113.10）通过 <b>localhost:远程端口</b> 访问本机的 ApiCluster API。
           本地主动向远程发起连接，无需远程机器开放任何入站端口。
@@ -292,7 +302,8 @@
           <div class="setting-row">
             <div class="setting-info">
               <div class="setting-title">断开自动重连</div>
-              <div class="muted">隧道断开后自动按退避策略重连（默认开启，关闭则断开后不再重试）</div>
+              <div class="muted">关闭时：不只是断开不重连，<b>启动那一刻第一次连接失败也不会再试</b>，
+                界面会停在「已断开」并显示原因，需要你手动点「启动」</div>
             </div>
             <label class="switch"><input type="checkbox" id="tun-autoreconnect"><span class="slider"></span></label>
           </div>
@@ -325,8 +336,10 @@
           <div id="chat-log" class="chat-log"></div>
           <div class="chat-input">
             <textarea id="chat-text" rows="3" placeholder="输入问题，回车发送（Shift+Enter 换行）"></textarea>
+            <button class="mini-btn" id="btn-clear-chat" title="清空上面的对话与上下文">清空</button>
             <button class="btn primary" id="btn-send">发送</button>
           </div>
+          <div class="muted" style="margin-top:8px">本次会话会带上最近几轮上下文（可追问「它是谁」这类问题）；点「清空」另起一轮。</div>
         </div>
       </section>
 
@@ -343,16 +356,22 @@
         <div class="setting-row">
           <div class="setting-info">
             <div class="setting-title">代理端口</div>
-            <div class="muted">OpenAI 兼容入口 http://localhost:{端口}/v1</div>
+            <div class="muted">OpenAI 兼容入口 http://localhost:<span class="js-port">3003</span>/v1，改完需重启程序生效</div>
           </div>
-          <input type="number" id="set-port" class="port-input" value="3003" min="1024" max="65535">
+          <div class="cli-actions">
+            <input type="number" id="set-port" class="port-input" value="3003" min="1024" max="65535">
+            <button class="mini-btn" id="btn-restart-app">重启程序</button>
+          </div>
+        </div>
+        <div class="key-banner hidden" id="port-restart-tip">
+          <span>⚠ 端口改了但还没重启，现在生效的还是旧端口 —— 上面示例里的地址就是当前实际在用的。</span>
         </div>
         <div class="muted hint" id="settings-hint">修改自动保存</div>
         <div class="usage-tip">
           <h3>客户端怎么填？</h3>
           <table>
             <tr><th>字段</th><th>填什么</th><th>示例</th></tr>
-            <tr><td>API 地址 / Base URL</td><td>本地代理地址</td><td>http://localhost:3003/v1</td></tr>
+            <tr><td>API 地址 / Base URL</td><td>本地代理地址</td><td>http://localhost:<span class="js-port">3003</span>/v1</td></tr>
             <tr><td>API Key</td><td>任意值（本地无需鉴权）</td><td>byok</td></tr>
             <tr><td>模型 Model</td><td>模型 id 或 inurl</td><td>qwen-max / inurl / inurl-code</td></tr>
           </table>
@@ -361,6 +380,6 @@
     </main>
   </div>
 
-  <script src="app.js?v=20260923a"></script>
+  <script src="app.js?v=20260926a"></script>
 </body>
 </html>

@@ -21,6 +21,7 @@ import (
 	"apicluster/internal/balance"
 	"apicluster/internal/catalog"
 	"apicluster/internal/config"
+	"apicluster/internal/proxy"
 	"apicluster/internal/sidecar"
 	"apicluster/internal/tunnel"
 )
@@ -33,6 +34,9 @@ type Handler struct {
 	proxyPort int
 	cli       *sidecar.Manager
 	tun       *tunnel.Manager
+	// Restart 由 main 注入：安排重启自身（停边车/停隧道后重新拉起新进程）。
+	// 为 nil 时「重启程序」不可用（例如只跑 HTTP 服务的场景）。
+	Restart func()
 }
 
 // New 创建 Handler
@@ -60,6 +64,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleSchemes(w, r)
 	case path == "/api/vault" && r.Method == http.MethodPost:
 		h.handleVault(w, r)
+	case path == "/api/marks" && r.Method == http.MethodPost:
+		h.handleMarks(w, r)
 	case path == "/api/vault/export" && r.Method == http.MethodPost:
 		h.handleVaultExport(w, r)
 	case path == "/api/test" && r.Method == http.MethodPost:
@@ -70,6 +76,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleOpen(w, r)
 	case path == "/api/theme" && r.Method == http.MethodGet:
 		h.handleTheme(w, r)
+	case path == "/api/restart" && r.Method == http.MethodPost:
+		h.handleRestart(w, r)
 	// ===== 内置 CLIProxyAPI 边车（订阅账号） =====
 	case path == "/api/cliproxy/status" && r.Method == http.MethodGet:
 		h.handleCliStatus(w, r)
@@ -79,6 +87,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleCliSettings(w, r)
 	case path == "/api/cliproxy/fix-mgmt-key" && r.Method == http.MethodPost:
 		h.handleCliFixKey(w, r)
+	case path == "/api/cliproxy/browse-exe" && r.Method == http.MethodPost:
+		h.handleCliBrowseExe(w, r)
+	case path == "/api/cliproxy/kill-orphan" && r.Method == http.MethodPost:
+		h.handleCliKillOrphan(w, r)
 	case path == "/api/cliproxy/mgmt":
 		h.handleCliMgmt(w, r)
 	case path == "/api/cliproxy/login" && r.Method == http.MethodGet:
@@ -98,6 +110,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleTunnelAction(w, r)
 	case path == "/api/tunnel/log" && r.Method == http.MethodGet:
 		h.handleTunnelLog(w, r)
+	case path == "/api/tunnel/probe" && r.Method == http.MethodPost:
+		h.handleTunnelProbe(w, r)
+	case path == "/api/tunnel/kill-orphan" && r.Method == http.MethodPost:
+		h.handleTunnelKillOrphan(w, r)
 	case path == "/api/tunnel/browse-pem" && r.Method == http.MethodPost:
 		h.handleTunnelBrowsePem(w, r)
 	default:
@@ -120,7 +136,10 @@ func (h *Handler) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		"settings":  cfg.Settings,
 		"schemes":   cfg.Schemes,
 		"vault":     cfg.Vault,
+		"marks":     cfg.Marks,
 		"autostart": autostart.IsEnabled(),
+		// 进程实际监听的端口（settings.proxy_port 是「配置值」，两者不等就说明没重启）
+		"running_port": h.proxyPort,
 	})
 }
 
@@ -148,13 +167,19 @@ func (h *Handler) handleSetKey(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg := config.Get()
 	existing := cfg.Keys[body.ProviderID]
-	// 多 key 优先，兼容单 key
+	// 内置厂商的 Key 列表按「整体替换」处理：界面每次发来的是卡片上的完整状态，
+	// 空列表就意味着用户把输入框清空了、要删掉 Key。
+	// 旧写法在列表为空时两个分支都不进，于是旧 Key 原样留着，
+	// 而名称/编号已被清空 —— 表现是「Key 没删掉，名字先没了」。
 	if len(body.APIKeys) > 0 {
 		existing.APIKeys = body.APIKeys
 		existing.APIKey = "" // 清空旧单 key
 	} else if body.APIKey != "" {
 		existing.APIKey = body.APIKey
 		existing.APIKeys = []string{body.APIKey}
+	} else {
+		existing.APIKeys = nil
+		existing.APIKey = ""
 	}
 	existing.KeyNames = body.KeyNames
 	existing.KeyNos = body.KeyNos
@@ -262,32 +287,118 @@ func (h *Handler) handleDeleteCustom(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// handleSettings 保存全局设置。
+// 必须在现有 Settings 上逐字段覆盖：前端只发它自己那几项，
+// 若把请求体整个反序列化再写入，cliproxy（含管理密钥）与 tunnel 配置会被清零，
+// 表现就是「拨一下开机自启，订阅账号边车/远程隧道全回到出厂」+ 管理面板 401。
 func (h *Handler) handleSettings(w http.ResponseWriter, r *http.Request) {
-	var s config.Settings
-	if err := json.NewDecoder(r.Body).Decode(&s); err != nil {
+	var body map[string]json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	s := config.Get().Settings
+	assign := func(key string, dst any) error {
+		raw, ok := body[key]
+		if !ok {
+			return nil // 没发过来的字段保持原值
+		}
+		return json.Unmarshal(raw, dst)
+	}
+	fields := []struct {
+		key string
+		dst any
+	}{
+		{"autostart", &s.AutoStart},
+		{"proxy_port", &s.ProxyPort},
+		{"auto_open_browser", &s.AutoOpenBrowser},
+		{"auto_route_enabled", &s.AutoRouteEnabled},
+		{"auto_models", &s.AutoModels},
+		{"auto_provider_order", &s.AutoProviderOrder},
+	}
+	for _, f := range fields {
+		if err := assign(f.key, f.dst); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": f.key + ": " + err.Error()})
+			return
+		}
+	}
+	if s.ProxyPort == 0 {
+		s.ProxyPort = 3003
+	}
 	config.SetSettings(s)
+	var autoErr string
 	if s.AutoStart {
-		_ = autostart.Enable()
-	} else {
-		_ = autostart.Disable()
+		if err := autostart.Enable(); err != nil {
+			autoErr = err.Error()
+			// 开启失败就把开关拨回已保存的值，别让界面显示「已开」而注册表里没写
+			s.AutoStart = false
+			config.SetSettings(s)
+		}
+	} else if err := autostart.Disable(); err != nil {
+		autoErr = err.Error()
 	}
 	_ = config.Save()
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	resp := map[string]any{"ok": true, "autostart": autostart.IsEnabled(),
+		// 真实在监听的端口：界面用它判断「配置已改但还没重启」
+		"running_port": h.proxyPort}
+	if autoErr != "" {
+		resp["error"] = autoErr
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
-// handleSchemes 整体保存自动路由方案（一个别名 → 一组有序模型）
+// handleSchemes 整体保存自动路由方案（一个别名 → 一组有序模型）。
+// 名字与内置别名（inurl / inurl-code / …）冲突的方案会被剔掉并回给前端提示，
+// 而不是整批拒绝 —— 后者会让用户改一个名字就丢掉其他方案的编辑。
 func (h *Handler) handleSchemes(w http.ResponseWriter, r *http.Request) {
 	var schemes []config.RouteScheme
 	if err := json.NewDecoder(r.Body).Decode(&schemes); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	config.SetSchemes(schemes)
+	kept := make([]config.RouteScheme, 0, len(schemes))
+	rejected := make([]string, 0, 2)
+	for _, sc := range schemes {
+		if proxy.IsReservedAlias(sc.Name) {
+			rejected = append(rejected, sc.Name)
+			continue
+		}
+		kept = append(kept, sc)
+	}
+	config.SetSchemes(kept)
 	_ = config.Save()
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	resp := map[string]any{"ok": true}
+	if len(rejected) > 0 {
+		resp["rejected"] = rejected
+		resp["error"] = "方案名不能与内置别名相同：" + strings.Join(rejected, "、") + "（这些名字已由自动路由占用）"
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleMarks 整体保存密钥库的收藏 / 分组标记（按厂商 ID 关联）。
+// 全量替换：前端发来的是界面上完整的标记集合；空的（未收藏且未分组）不落盘，
+// 免得 keys.json 里堆一堆没意义的条目。
+func (h *Handler) handleMarks(w http.ResponseWriter, r *http.Request) {
+	var in map[string]config.LibraryMark
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	out := make(map[string]config.LibraryMark, len(in))
+	for id, m := range in {
+		id = strings.TrimSpace(id)
+		m.Group = strings.TrimSpace(m.Group)
+		if r := []rune(m.Group); len(r) > 16 {
+			m.Group = string(r[:16]) // 按字（不是字节）截断，避免把中文分组名切出乱码
+		}
+		if id == "" || (!m.Favorite && m.Group == "") {
+			continue
+		}
+		out[id] = m
+	}
+	config.SetMarks(out)
+	_ = config.Save()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "marks": out})
 }
 
 // maxVaultLogoBytes 内联 logo（data URL）的体积上限。前端上传时会先用 canvas
@@ -485,9 +596,18 @@ func (h *Handler) handleBalance(w http.ResponseWriter, r *http.Request) {
 	results := make([]map[string]any, 0, len(keys))
 	for i, key := range keys {
 		res := balance.Query(id, key)
+		name, no := "", i+1
+		if i < len(pc.KeyNames) {
+			name = pc.KeyNames[i]
+		}
+		if i < len(pc.KeyNos) && pc.KeyNos[i] > 0 {
+			no = pc.KeyNos[i]
+		}
 		results = append(results, map[string]any{
 			"index":   i,
 			"current": i == pc.KeyIndex,
+			"name":    name, // 与卡片行标签一致，避免「Key 2」贴到别的 Key 上
+			"no":      no,
 			"ok":      res.OK,
 			"text":    res.Text,
 			"error":   res.Error,
@@ -583,6 +703,21 @@ func (h *Handler) handleOpen(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// handleRestart 让界面也能触发「重启程序」：设置页改端口后必须重启才生效，
+// 以前只有一句文案，用户得自己去托盘找。真正的重启由 main 注入的钩子完成
+// （走和托盘「重启」一样的路径：安排新实例 → 停边车/隧道 → 落盘 → 退出）。
+func (h *Handler) handleRestart(w http.ResponseWriter, r *http.Request) {
+	if h.Restart == nil {
+		writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "当前运行方式不支持从界面重启，请手动退出后重新打开"})
+		return
+	}
+	go func() {
+		time.Sleep(400 * time.Millisecond) // 先把响应发出去再走关闭流程
+		h.Restart()
+	}()
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 // handleTheme 返回 LifeSystem 写入的主题同步文件内容（dark/light），
 // 供前端轮询、在 ApiCluster 被内嵌时跟随 LifeSystem 的主题切换。
 func (h *Handler) handleTheme(w http.ResponseWriter, r *http.Request) {
@@ -617,9 +752,22 @@ func (h *Handler) handleCliStatus(w http.ResponseWriter, r *http.Request) {
 	port, _ := st["port"].(int)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":    st,
+		"orphan":    h.cli.Orphan(), // 端口上是否有不归本程序管理的残留边车（强杀后会遇到）
 		"providers": sidecar.OAuthProviders(),
 		"endpoints": sidecar.EndpointHelp(port),
 	})
+}
+
+// handleCliKillOrphan 结束占用边车端口的「上一轮自家残留实例」（只按 PID 精确结束）
+func (h *Handler) handleCliKillOrphan(w http.ResponseWriter, r *http.Request) {
+	if !h.cliGuard(w) {
+		return
+	}
+	if err := h.cli.KillOrphan(); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": h.cli.Status(), "orphan": h.cli.Orphan()})
 }
 
 // handleCliAction 启动 / 停止 / 重启边车
@@ -665,6 +813,7 @@ func (h *Handler) handleCliSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s := config.Get().Settings
+	wasEnabled := s.CliProxy.Enabled
 	if body.Enabled != nil {
 		s.CliProxy.Enabled = *body.Enabled
 	}
@@ -678,7 +827,16 @@ func (h *Handler) handleCliSettings(w http.ResponseWriter, r *http.Request) {
 	_ = config.Save()
 	// 端口/路径变化后重写边车 config.yaml
 	_, _ = h.cli.Ensure()
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": h.cli.Status()})
+	// 把「随 ApiCluster 启动」从开改成关，同时停掉当前正在跑的边车：
+	// 这个开关在订阅账号页就在启停按钮旁边，用户理解的就是「关＝别在跑」。
+	stoppedNow := false
+	if wasEnabled && !s.CliProxy.Enabled {
+		if r, ok := h.cli.Status()["running"].(bool); ok && r {
+			h.cli.Stop()
+			stoppedNow = true // 只在真的停了的时候才这么报
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "stopped": stoppedNow, "status": h.cli.Status()})
 }
 
 // handleCliFixKey 一键修复管理面板 401：把明文管理密钥写回边车 config.yaml
@@ -702,16 +860,17 @@ func (h *Handler) handleCliFixKey(w http.ResponseWriter, r *http.Request) {
 		wasRunning = st
 	}
 	verified := false
+	note := "配置已重写；边车当前没有运行，下次启动后生效"
 	if wasRunning {
 		if err := h.cli.Restart(); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "配置已修复，但重启边车失败：" + err.Error()})
 			return
 		}
-		verified = h.cli.VerifyMgmtKey(25 * time.Second)
-	}
-	note := "配置已重写；边车未运行，下次启动后生效"
-	if verified {
-		note = "已修复并通过鉴权实测"
+		if verified = h.cli.VerifyMgmtKey(25 * time.Second); verified {
+			note = "已修复并通过鉴权实测"
+		} else {
+			note = "配置已重写、边车也已重启，但鉴权仍没通过；请展开下方运行日志看 CLIProxyAPI 自己的报错"
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":       true,
@@ -719,6 +878,36 @@ func (h *Handler) handleCliFixKey(w http.ResponseWriter, r *http.Request) {
 		"verified": verified,
 		"note":     note,
 	})
+}
+
+// handleCliBrowseExe 弹出系统文件对话框让用户挑 CLIProxyAPI.exe，
+// 免得在输入框里手敲一长串路径。起始目录用自动查找命中的那个目录。
+func (h *Handler) handleCliBrowseExe(w http.ResponseWriter, r *http.Request) {
+	dir := ""
+	if exe, ok := sidecar.ResolveExe(config.Get().Settings.CliProxy.ExePath); ok {
+		dir = filepath.Dir(exe)
+	}
+	ps := fmt.Sprintf(`Add-Type -AssemblyName System.Windows.Forms
+$d = New-Object System.Windows.Forms.OpenFileDialog
+$d.Title = %s
+$d.Filter = '可执行文件 (*.exe)|*.exe|所有文件 (*.*)|*.*'
+$d.InitialDirectory = %s
+if (-not (Test-Path $d.InitialDirectory)) { $d.InitialDirectory = [Environment]::GetFolderPath('UserProfile') }
+if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Write($d.FileName) }`,
+		psQuote("选择 CLIProxyAPI.exe"), psQuote(dir))
+	cmd := exec.Command("powershell", "-NoProfile", "-STA", "-Command", ps)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	out, err := cmd.Output()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "打开文件选择框失败: " + err.Error()})
+		return
+	}
+	path := strings.TrimSpace(string(out))
+	if path == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "cancelled": true})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": path})
 }
 
 // handleCliMgmt 通用管理接口代理：path 为边车管理接口路径（可带 ?query）
@@ -886,7 +1075,39 @@ func (h *Handler) handleTunnelStatus(w http.ResponseWriter, r *http.Request) {
 	if v, _ := st["remote_port"].(int); v <= 0 {
 		st["remote_port"] = h.proxyPort
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": st})
+	// 残留隧道：界面必须区分「我起的」和「上一轮遗留的」，否则用户看到已停止
+	// 而远程端口其实还被旧会话占着
+	writeJSON(w, http.StatusOK, map[string]any{"status": st, "orphans": h.tun.Orphans()})
+}
+
+// handleTunnelProbe 真的去远程那一侧看一眼端口通不通：
+// 「ssh 进程活着」不等于「反向隧道可用」，这个按钮给出确定答案。
+func (h *Handler) handleTunnelProbe(w http.ResponseWriter, r *http.Request) {
+	if h.tun == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "隧道服务未初始化"})
+		return
+	}
+	writeJSON(w, http.StatusOK, h.tun.ProbeRemote())
+}
+
+// handleTunnelKillOrphan 结束指定的残留隧道进程（后端会再校验一次命令行）
+func (h *Handler) handleTunnelKillOrphan(w http.ResponseWriter, r *http.Request) {
+	if h.tun == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "隧道服务未初始化"})
+		return
+	}
+	var body struct {
+		PID int `json:"pid"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := h.tun.KillOrphan(body.PID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": h.tun.Status(), "orphans": h.tun.Orphans()})
 }
 
 // handleTunnelSettings 保存隧道设置（pem / host / user / 端口 / 随启动 / 自动重连）

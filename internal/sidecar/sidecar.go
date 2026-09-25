@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -33,6 +34,8 @@ const (
 	readyTimeout = 45 * time.Second
 	// 异常退出后的最大自动重启次数
 	maxRestarts = 5
+	// 稳定运行超过这个时长后再崩，重新给满自动重启配额
+	stableUptime = 60 * time.Second
 )
 
 // Manager 边车进程管理器（并发安全）
@@ -193,8 +196,8 @@ func looksLikeBcrypt(s string) bool {
 func renderConfig(cs config.CliProxySettings, secretKey string) string {
 	yamlPath := func(p string) string { return strings.ReplaceAll(p, "\\", "/") }
 	var b strings.Builder
-	b.WriteString("# 本文件由 ApiCluster 自动生成，手工修改会在下次启动时被覆盖。\n")
-	b.WriteString("# 若需深度定制，请在 ApiCluster 的「订阅账号」页把配置路径指向你自己的文件。\n")
+	b.WriteString("# 本文件由 ApiCluster 自动生成，每次启动/改设置都会被覆盖，请勿手工修改。\n")
+	b.WriteString("# 要改端口、exe 路径或密钥，请在 ApiCluster 的「订阅账号」页操作。\n")
 	b.WriteString("host: \"127.0.0.1\"\n")
 	fmt.Fprintf(&b, "port: %d\n", cs.Port)
 	fmt.Fprintf(&b, "auth-dir: \"%s\"\n", yamlPath(cs.AuthDir))
@@ -289,35 +292,134 @@ func (m *Manager) Start() error {
 	m.mu.Unlock()
 
 	go m.waitLoop(cmd)
-	go m.healthLoop(cs.Port)
+	go m.healthLoop()
 	return nil
 }
 
-// cleanupOrphan 检查端口占用。若占用者是上一轮残留的 CLIProxyAPI 实例
-// （用我们自己的管理密钥能通过鉴权即认定为我们的实例），先结束它再启动，
-// 避免 ApiCluster 被强杀后重启时因端口占用而无法拉起边车。
-func (m *Manager) cleanupOrphan(port int) error {
-	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-	if err == nil {
-		_ = ln.Close()
-		return nil // 端口空闲
+// portOwner 返回监听该端口的进程 PID 与进程名（无人监听返回 0,""）。
+// 用 PowerShell 查一次，只在端口被占这类少见分支里调用。
+func portOwner(port int) (int, string) {
+	ps := fmt.Sprintf(
+		"$c = Get-NetTCPConnection -LocalPort %d -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1;"+
+			" if ($c) { $p = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue; if ($p) { Write-Output (\"{0}|{1}\" -f $p.Id, $p.ProcessName) } }",
+		port)
+	cmd := exec.Command("powershell", "-NoProfile", "-Command", ps)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, ""
 	}
+	line := strings.TrimSpace(string(out))
+	i := strings.LastIndex(line, "|")
+	if i <= 0 {
+		return 0, ""
+	}
+	pid, _ := strconv.Atoi(strings.TrimSpace(line[:i]))
+	return pid, strings.TrimSpace(line[i+1:])
+}
+
+// probeWithMgmtKey 用当前管理密钥访问边车：200 表示这就是我们自己那台实例。
+func probeWithMgmtKey(port int) bool {
 	cs := config.Get().Settings.CliProxy
-	req, reqErr := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/v0/management/config", port), nil)
-	if reqErr != nil {
-		return fmt.Errorf("边车端口 %d 已被占用，请关闭占用程序或换端口", port)
+	if cs.MgmtKey == "" {
+		return false
+	}
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/v0/management/config", port), nil)
+	if err != nil {
+		return false
 	}
 	req.Header.Set("X-Management-Key", cs.MgmtKey)
-	resp, doErr := (&http.Client{Timeout: 3 * time.Second}).Do(req)
-	if doErr != nil {
-		return fmt.Errorf("边车端口 %d 已被其他程序占用，请关闭占用程序或换端口", port)
+	resp, err := (&http.Client{Timeout: 3 * time.Second}).Do(req)
+	if err != nil {
+		return false
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("边车端口 %d 已被其他程序占用，请关闭占用程序或换端口", port)
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode == http.StatusOK
+}
+
+// portListening 端口上是否有人监听（先花 150ms 探一下，避免每 5 秒去起 PowerShell）
+func portListening(port int) bool {
+	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 150*time.Millisecond)
+	if err != nil {
+		return false
 	}
-	// 是我们自己残留的实例：结束它
-	_ = exec.Command("taskkill", "/F", "/IM", "CLIProxyAPI.exe").Run()
+	_ = c.Close()
+	return true
+}
+
+// Orphan 报告「端口上有一台边车在跑、但不归本管理器管」这种状态。
+// ApiCluster 被强杀时子进程不会被级联结束；界面只按 m.cmd 判断的话，
+// 会显示「已停止」而端口实际还在被用。
+func (m *Manager) Orphan() map[string]any {
+	cs := config.Get().Settings.CliProxy
+	port := cs.Port
+	if port == 0 {
+		port = defaultPort
+	}
+	out := map[string]any{"port": port, "port_busy": false, "ours": false, "pid": 0, "name": ""}
+	if m.isRunning() {
+		out["port_busy"] = true
+		out["ours"] = true
+		return out
+	}
+	if !portListening(port) {
+		return out
+	}
+	pid, name := portOwner(port)
+	if pid == 0 {
+		out["port_busy"] = true // 有人监听但查不到是谁（权限或时序）
+		return out
+	}
+	out["port_busy"], out["pid"], out["name"] = true, pid, name
+	out["ours"] = probeWithMgmtKey(port) // 密钥能通 = 上一轮残留的自家实例
+	return out
+}
+
+// KillOrphan 结束占用端口的那台残留边车。只动「用我们的管理密钥能鉴权通过」
+// 的那一个 PID：按镜像名 taskkill /IM 会连带杀掉用户自己另外开的 CLIProxyAPI。
+func (m *Manager) KillOrphan() error {
+	port := config.Get().Settings.CliProxy.Port
+	if port == 0 {
+		port = defaultPort
+	}
+	pid, name := portOwner(port)
+	if pid == 0 {
+		return nil // 端口本来就空着
+	}
+	if name != "CLIProxyAPI" || !probeWithMgmtKey(port) {
+		return fmt.Errorf("端口 %d 被 PID %d（%s）占用，它不是 ApiCluster 启动的边车，不会替你结束它；请改端口或自行处理该进程", port, pid, name)
+	}
+	if err := exec.Command("taskkill", "/F", "/PID", strconv.Itoa(pid)).Run(); err != nil {
+		return fmt.Errorf("结束残留边车（PID %d）失败: %w", pid, err)
+	}
+	time.Sleep(800 * time.Millisecond)
+	return nil
+}
+
+// isRunning 是否有由本管理器启动的进程在跑
+func (m *Manager) isRunning() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cmd != nil
+}
+
+// cleanupOrphan 启动前检查端口占用：占用者若是能用我们的管理密钥鉴权通过的
+// CLIProxyAPI，就认定是上一轮残留的自家实例，只结束那一个 PID。
+func (m *Manager) cleanupOrphan(port int) error {
+	if !portListening(port) {
+		return nil // 端口空闲（绝大多数情况，省一次 PowerShell）
+	}
+	pid, name := portOwner(port)
+	if pid == 0 {
+		return nil // 监听者查不到（权限/时序）：交给后面的端口绑定去报错
+	}
+	if name != "CLIProxyAPI" || !probeWithMgmtKey(port) {
+		return fmt.Errorf("边车端口 %d 已被其他程序占用（PID %d，%s），请关闭该程序或换端口", port, pid, name)
+	}
+	if err := exec.Command("taskkill", "/F", "/PID", strconv.Itoa(pid)).Run(); err != nil {
+		return fmt.Errorf("结束残留边车（PID %d）失败: %w", pid, err)
+	}
 	time.Sleep(800 * time.Millisecond)
 	return nil
 }
@@ -351,15 +453,27 @@ func (m *Manager) waitLoop(cmd *exec.Cmd) {
 	} else {
 		m.lastErr = "边车已退出"
 	}
-	shouldRestart := m.restarts < maxRestarts
-	if shouldRestart {
+	// 稳态跑过一阵子之后再崩，算新一轮故障，重新给满重启配额；
+	// 秒崩秒起的抖动只消耗同一份配额 —— 否则就绪时清零会让「自动重启」变成无限重启。
+	if !m.startedAt.IsZero() && time.Since(m.startedAt) >= stableUptime {
+		m.restarts = 0
+	}
+	// 「随 ApiCluster 启动」关着时不做崩溃自愈：用户手动点过一次「启动」，
+	// 不等于同意这个进程在他关掉以后被无限拉起来。
+	enabled := config.Get().Settings.CliProxy.Enabled
+	shouldRestart := enabled && m.restarts < maxRestarts
+	switch {
+	case shouldRestart:
 		m.restarts++
+	case enabled:
+		m.lastErr += "（已达自动重启上限，请查看日志）"
+	default:
+		m.lastErr += "（未开启「随 ApiCluster 启动」，崩溃后不再自动重启）"
 	}
 	attempt := m.restarts
 	m.mu.Unlock()
 
 	if !shouldRestart {
-		m.lastErr += "（已达自动重启上限，请查看日志）"
 		return
 	}
 	// 退避后重启
@@ -374,10 +488,11 @@ func (m *Manager) waitLoop(cmd *exec.Cmd) {
 	}()
 }
 
-// healthLoop 轮询 /healthz 直到就绪
-func (m *Manager) healthLoop(port int) {
+// healthLoop 轮询 /healthz 直到就绪。
+// 端口每轮都从当前配置读：用户在「订阅账号」页改了端口还没重启边车时，
+// 探测旧端口会把 ready 报成 true（实际端口上没人监听），是种说谎的就绪状态。
+func (m *Manager) healthLoop() {
 	deadline := time.Now().Add(readyTimeout)
-	url := fmt.Sprintf("http://127.0.0.1:%d/healthz", port)
 	for time.Now().Before(deadline) {
 		m.mu.Lock()
 		alive := m.cmd != nil
@@ -385,7 +500,11 @@ func (m *Manager) healthLoop(port int) {
 		if !alive {
 			return
 		}
-		resp, err := m.client.Get(url)
+		port := config.Get().Settings.CliProxy.Port
+		if port == 0 {
+			port = defaultPort
+		}
+		resp, err := m.client.Get(fmt.Sprintf("http://127.0.0.1:%d/healthz", port))
 		if err == nil {
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
@@ -393,7 +512,7 @@ func (m *Manager) healthLoop(port int) {
 				m.mu.Lock()
 				m.ready = true
 				m.status = "running"
-				m.restarts = 0
+				m.lastErr = "" // 已经好了就别再把上一次的崩溃提示常驻在页面上
 				m.mu.Unlock()
 				return
 			}

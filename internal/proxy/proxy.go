@@ -239,6 +239,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, endpoint str
 
 	// 2) 内置能力别名（inurl / inurl-code / inurl-image / inurl-video / inurl-audio）
 	if cap, ok := routeAlias(model); ok {
+		// 「自动路由（inurl）」总开关必须真的起作用：关掉后别名不再轮询厂商，
+		// 用户自己命名的方案（上面 1）不受影响，它们有自己的启用开关。
+		if !config.Get().Settings.AutoRouteEnabled {
+			s.writeError(w, http.StatusBadRequest,
+				fmt.Sprintf("自动路由（inurl）已在「自动路由配置」页关闭，请把 model 改成具体模型名或你自己的方案名"))
+			return
+		}
 		candidates := s.collectProviders(cap)
 		if len(candidates) == 0 {
 			s.writeError(w, http.StatusBadGateway, fmt.Sprintf("当前没有支持「%s」类别且已配置 Key 的厂商，请先在密钥库添加厂商 API Key", cap))
@@ -557,11 +564,15 @@ func (s *Server) forwardWithKeyRotation(t providerTarget, req map[string]any, en
 	return 0, 0, fmt.Errorf("厂商 %s 所有 key 均尝试失败", t.name)
 }
 
-// updateKeyIndex 同步 key 顺序与 index 到 config（内置厂商与自定义厂商都处理）
+// updateKeyIndex 同步 key 顺序与 index 到 config（内置厂商与自定义厂商都处理）。
+// 名称与稳定编号必须一起写回：轮换改变了 apiKeys 的顺序，只写 key 的话
+// 「主号 / Key 3」这类标签就会贴到别的 Key 上。
 func (s *Server) updateKeyIndex(t providerTarget) {
 	cfg := config.Get()
 	if pc, ok := cfg.Keys[t.id]; ok {
 		pc.APIKeys = append([]string(nil), t.apiKeys...)
+		pc.KeyNames = append([]string(nil), t.keyNames...)
+		pc.KeyNos = append([]int(nil), t.keyNos...)
 		pc.KeyIndex = t.keyIndex
 		config.SetKey(t.id, pc)
 		return
@@ -569,6 +580,8 @@ func (s *Server) updateKeyIndex(t providerTarget) {
 	for _, c := range cfg.Custom {
 		if c.ID == t.id {
 			c.APIKeys = append([]string(nil), t.apiKeys...)
+			c.KeyNames = append([]string(nil), t.keyNames...)
+			c.KeyNos = append([]int(nil), t.keyNos...)
 			c.KeyIndex = t.keyIndex
 			config.UpsertCustom(c)
 			return

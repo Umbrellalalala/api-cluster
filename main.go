@@ -36,9 +36,10 @@ import (
 )
 
 const (
-	wmShowApp uint32 = win.WM_APP + 0x100 // 自定义消息：显示主窗口
-	wmTrayMsg uint32 = win.WM_APP + 0x200 // 托盘图标回调消息
-	wmSetIcon uint32 = 0x0080             // WM_SETICON：设置标题栏/任务栏图标
+	wmShowApp   uint32 = win.WM_APP + 0x100 // 自定义消息：显示主窗口
+	wmRestartApp uint32 = win.WM_APP + 0x101 // 自定义消息：在 UI 线程执行「重启本程序」
+	wmTrayMsg   uint32 = win.WM_APP + 0x200 // 托盘图标回调消息
+	wmSetIcon   uint32 = 0x0080             // WM_SETICON：设置标题栏/任务栏图标
 )
 
 const (
@@ -275,6 +276,9 @@ func subclassWndProc(h uintptr) {
 		case wmShowApp:
 			showWindowFromTray(hwin)
 			return 0
+		case wmRestartApp:
+			restartApp(hwin)
+			return 0
 		case wmTrayMsg:
 			switch uint32(lParam) {
 			case win.WM_LBUTTONUP: // 左键：直接打开窗口
@@ -288,10 +292,7 @@ func subclassWndProc(h uintptr) {
 			case trayCmdOpen:
 				showWindowFromTray(hwin)
 			case trayCmdRestart:
-				restartSelf() // 先安排新实例，再走与「退出」相同的关闭流程
-				quitting.Store(true)
-				removeTray()
-				win.PostMessage(hwin, win.WM_CLOSE, 0, 0)
+				restartApp(hwin)
 			case trayCmdQuit:
 				quitting.Store(true)
 				removeTray()
@@ -312,7 +313,10 @@ func startServer(port int, sc *sidecar.Manager, tun *tunnel.Manager) (chan struc
 	p := proxy.New()
 	mux.Handle("/v1/", p)
 	mux.HandleFunc("/healthz", p.Healthz)
-	mux.Handle("/", webui.New(port, sc, tun))
+	ui := webui.New(port, sc, tun)
+	// 界面里的「重启程序」把动作投递回 UI 线程执行，与托盘「重启」共用一条路径
+	ui.Restart = func() { win.PostMessage(win.HWND(hwndPtr.Load()), wmRestartApp, 0, 0) }
+	mux.Handle("/", ui)
 
 	srv := &http.Server{Handler: mux}
 
@@ -466,6 +470,15 @@ func showTrayMenu(hwin win.HWND) {
 	win.TrackPopupMenu(menu, win.TPM_RIGHTBUTTON, pt.X, pt.Y, 0, hwin, nil)
 }
 
+// restartApp 在 UI 线程执行「重启本程序」：先安排新实例，再走与托盘「退出」
+// 完全相同的关闭流程（停边车 / 停隧道 / 落盘）。
+func restartApp(hwin win.HWND) {
+	restartSelf()
+	quitting.Store(true)
+	removeTray()
+	win.PostMessage(hwin, win.WM_CLOSE, 0, 0)
+}
+
 // restartSelf 重新拉起一个自身实例；调用方随后按「退出」流程结束本进程。
 // 新实例必须等本进程退出后再启动——否则会被 acquireSingleInstance 的互斥体
 // 判为「已有实例」直接退出，端口也还没让出来。这里交给 PowerShell
@@ -478,9 +491,11 @@ func restartSelf() {
 		return
 	}
 	psQuote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
-	// -WindowStyle Hidden + HideWindow：拉起过程不闪出黑框
+	// 超时给到 40 秒：正常退出要走完停边车(≤5s)+停隧道(≤5s)+优雅关闭 HTTP，
+	// 等太短会让新实例撞上单实例互斥体直接退出，「重启」就静默变成「退出」。
+	// -WindowStyle Hidden + HideWindow：拉起过程不闪出黑框。
 	ps := fmt.Sprintf(
-		"$ErrorActionPreference='SilentlyContinue'; Wait-Process -Id %d -Timeout 15; Start-Process -FilePath %s -WorkingDirectory %s",
+		"$ErrorActionPreference='SilentlyContinue'; Wait-Process -Id %d -Timeout 40; Start-Process -FilePath %s -WorkingDirectory %s",
 		os.Getpid(), psQuote(exe), psQuote(filepath.Dir(exe)),
 	)
 	if rest := os.Args[1:]; len(rest) > 0 {
