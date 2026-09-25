@@ -4,6 +4,12 @@
 
 ![License](https://img.shields.io/badge/license-MIT-blue) ![Go](https://img.shields.io/badge/Go-1.27-00ADD8) ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![Runtime](https://img.shields.io/badge/runtime-none-0a0)
 
+## 界面
+
+![密钥库](docs/apicluster.png)
+
+左侧是密钥库 / 账号库 / 自动路由配置 / 订阅账号 / 管理面板 / 远程隧道；右侧「密钥库」把厂商按免费（17）与付费（19）分开，每张卡片带 logo、地区与协议、能力说明和模型 chips，填了 Key 的厂商会打 `✓ 已添加`。
+
 任何 AI 客户端（Cursor、OpenWebUI、各类 Agent 脚手架）都要为每家厂商单独配一份 Base URL + Key。ApiCluster 做的事：所有厂商统一收口，客户端只填三行，切厂商由本地代理负责，**请求从你的电脑直连厂商，Key 不出本机**。
 
 ## 功能
